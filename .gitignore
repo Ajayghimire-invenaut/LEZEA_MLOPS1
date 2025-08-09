@@ -127,3 +127,6 @@ docker-compose.override.yml
 tmp/
 temp/
 scratch/
+
+# secrets
+.env
