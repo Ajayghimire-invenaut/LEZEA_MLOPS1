@@ -32,6 +32,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from contextlib import contextmanager
 from collections import defaultdict, Counter
 
+# Optional Prometheus HTTP exporter
+try:
+    from prometheus_client import start_http_server as _prom_start
+except Exception:  # pragma: no cover
+    _prom_start = None  # type: ignore
+
 # Config
 from .config import config
 
@@ -173,7 +179,8 @@ class ExperimentTracker:
     # ---------------------------
     # Start / End
     # ---------------------------
-    def start(self) -> "ExperimentTracker":
+    def start(self, *, prom_port: Optional[int] = 8000, strict: bool = False) -> "ExperimentTracker":
+        """Start a run. If strict=True, fail when critical backends are down."""
         if self.is_active:
             self.logger.warning("Experiment already active")
             print("⚠️ Experiment already active")
@@ -201,9 +208,25 @@ class ExperimentTracker:
                     },
                 )
 
+            # Start Prometheus exporter (if requested and library present)
+            if prom_port and _prom_start:
+                try:
+                    _prom_start(prom_port)
+                    self.logger.info(f"Prometheus metrics on :{prom_port}")
+                    print(f"📡 Prometheus metrics on :{prom_port}")
+                except Exception as e:
+                    self.logger.warning(f"Prometheus exporter not started: {e}")
+                    if strict:
+                        raise
+
             # Start GPU monitor if present
             if self.gpu_monitor:
                 self.gpu_monitor.start_monitoring(self.experiment_id)
+
+            # Health check (soft or strict)
+            ok = self._health_check()
+            if strict and not ok:
+                raise RuntimeError("Backend health check failed")
 
             self.is_active = True
             print(f"🎯 Started experiment: {self.experiment_name}")
@@ -231,7 +254,7 @@ class ExperimentTracker:
                     pass
 
             # Persist final results summary (per scope)
-            results_summary = self._finalize_results_summary(log_to_backends=True)
+            _ = self._finalize_results_summary(log_to_backends=True)
 
             # Persist cost summary (if model available)
             if self.cost:
@@ -243,7 +266,6 @@ class ExperimentTracker:
                         self.backends["mongodb"].store_business_metrics(self.experiment_id, {"cost_model": cost_summary})
                     except Exception:
                         pass
-                # Prefer cost model's computed total if available
                 try:
                     self.total_cost = float(cost_summary.get("total_eur", self.total_cost))
                 except Exception:
@@ -300,6 +322,38 @@ class ExperimentTracker:
             self.logger.error(f"Error ending experiment: {e}")
             self.logger.error(traceback.format_exc())
             print(f"❌ Error ending experiment: {e}")
+
+    # ---------------------------
+    # Health Check
+    # ---------------------------
+    def _ping_backend(self, name: str, obj: Any) -> Tuple[bool, str]:
+        try:
+            if obj is None:
+                return False, "unavailable"
+            if hasattr(obj, "ping"):
+                ok, msg = obj.ping(), "ok"
+                return (bool(ok), msg if isinstance(ok, str) else "ok")
+            if hasattr(obj, "available"):
+                return (bool(getattr(obj, "available")), "available flag")
+            # Fallback: assume OK
+            return True, "assumed ok"
+        except Exception as e:  # pragma: no cover
+            return False, str(e)
+
+    def _health_check(self) -> bool:
+        checks = {}
+        for name, obj in self.backends.items():
+            ok, msg = self._ping_backend(name, obj)
+            checks[name] = (ok, msg)
+        # Log nice matrix
+        lines = ["\n🔎 Backend health:"]
+        ok_all = True
+        for n, (ok, msg) in checks.items():
+            ok_all &= bool(ok)
+            state = "✅" if ok else "❌"
+            lines.append(f"  {state} {n:8s} - {msg}")
+        print("\n".join(lines))
+        return ok_all
 
     # ---------------------------
     # Spec: 1.4 LeZeA configuration
@@ -367,6 +421,7 @@ class ExperimentTracker:
             "timestamp": datetime.now().isoformat(),
         }
         try:
+            params: Dict[str, Any] = {}
             if self.backends.get("mlflow"):
                 params = {k: v for k, v in self.constraints.items() if v is not None and k != "timestamp"}
                 if params:
