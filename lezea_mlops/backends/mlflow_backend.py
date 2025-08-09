@@ -6,14 +6,16 @@ Adds reliability and spec-aligned helpers:
 - Safe experiment creation + connection checks
 - Run lifecycle (parent/child runs supported via context manager)
 - Robust params/metrics/tags logging with type/length guards
-- Correct dictionary/text artifact logging (uses mlflow.log_dict/log_text when available)
+- Correct dictionary/text/figure artifact logging
 - Artifact helpers (files/dirs)
 - URLs for run/experiment
 - Experiment summary utilities
+- Health check ping() and availability flag
 """
 from __future__ import annotations
 
 import os
+import io
 import json
 import tempfile
 from contextlib import contextmanager
@@ -56,9 +58,11 @@ class MLflowBackend:
         self.current_run = None
         self.current_run_id: Optional[str] = None
         self._pending_experiment_tags: Dict[str, str] = {}
+        self.available: bool = False
 
         # Verify connection early
         self._verify_connection()
+        self.available = True
         print(f"✅ MLflow backend connected: {self.mlflow_config['tracking_uri']}")
 
     # ------------------------------------------------------------------
@@ -70,6 +74,14 @@ class MLflowBackend:
             _ = mlflow.search_experiments(max_results=1)
         except Exception as e:  # pragma: no cover — defensive
             raise ConnectionError(f"Failed to connect to MLflow: {e}")
+
+    def ping(self) -> bool:
+        """Health check used by the tracker."""
+        try:
+            _ = mlflow.search_experiments(max_results=1)
+            return True
+        except Exception:
+            return False
 
     def create_experiment(
         self,
@@ -114,7 +126,7 @@ class MLflowBackend:
                 "creation_timestamp": datetime.now().isoformat(),
             }
             if additional_tags:
-                base.update(additional_tags)
+                base.update({str(k): str(v) for k, v in additional_tags.items()})
             # Keep for next start_run (works across MLflow versions)
             self._pending_experiment_tags.update(base)
 
@@ -141,7 +153,7 @@ class MLflowBackend:
             if self._pending_experiment_tags:
                 run_tags.update(self._pending_experiment_tags)
             if tags:
-                run_tags.update(tags)
+                run_tags.update({str(k): str(v) for k, v in tags.items()})
 
             run = mlflow.start_run(run_name=run_name, tags=run_tags, nested=nested)
             self.current_run = run
@@ -299,6 +311,26 @@ class MLflowBackend:
         except Exception as e:  # pragma: no cover
             print(f"❌ Failed to log text: {e}")
 
+    def log_figure(self, figure, artifact_file: str) -> None:
+        """Log a matplotlib figure under the exact filename."""
+        try:
+            if hasattr(mlflow, "log_figure"):
+                mlflow.log_figure(figure, artifact_file)
+                print(f"🖼️ Logged figure as: {artifact_file}")
+                return
+            # Fallback: save PNG to temp and log_artifact
+            with tempfile.TemporaryDirectory() as tmp:
+                target = Path(tmp) / artifact_file
+                target.parent.mkdir(parents=True, exist_ok=True)
+                # If artifact_file has no extension, default to .png
+                if target.suffix == "":
+                    target = target.with_suffix(".png")
+                figure.savefig(str(target), bbox_inches="tight")
+                mlflow.log_artifacts(tmp)
+            print(f"🖼️ Logged figure as: {artifact_file}")
+        except Exception as e:  # pragma: no cover
+            print(f"❌ Failed to log figure: {e}")
+
     # ------------------------------------------------------------------
     # Registry & queries
     # ------------------------------------------------------------------
@@ -386,7 +418,7 @@ class MLflowBackend:
                 return {}
             runs = self.search_runs()
             if not runs:
-                return {"experiment_id": self.current_experiment_id, "run_count": 0}
+                return {"experiment_id": self.current_experiment_id, "run_count": 0, "mlflow_ui_url": self.get_experiment_url()}
             completed = [r for r in runs if r.get("status") == "FINISHED"]
             failed = [r for r in runs if r.get("status") == "FAILED"]
             running = [r for r in runs if r.get("status") == "RUNNING"]

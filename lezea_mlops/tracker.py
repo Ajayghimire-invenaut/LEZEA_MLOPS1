@@ -15,6 +15,7 @@ Spec coverage (concise):
 - Checkpoints + final models
 - Results (tasker/builder rewards, RL episodes, classification metrics, generation outputs) + summary
 - Business metrics (manual cost/comments/conclusion)
+- Data-usage rate & learning relevance attribution
 
 Backends degrade gracefully if unavailable.
 """
@@ -51,6 +52,10 @@ from .backends.dvc_backend import DVCBackend
 # Monitoring
 from .monitoring.gpu_monitor import GPUMonitor
 from .monitoring.env_tags import EnvironmentTagger
+try:
+    from .monitoring.data_usage import DataUsageLogger
+except Exception:
+    DataUsageLogger = None  # type: ignore
 
 # Utils
 from .utils.logging import get_logger
@@ -131,6 +136,9 @@ class ExperimentTracker:
 
         # Optional cost model instance (if available)
         self.cost = CostModel.from_env() if CostModel else None  # type: ignore
+
+        # Data usage / learning relevance (optional)
+        self.data_usage = DataUsageLogger() if DataUsageLogger else None  # type: ignore
 
         print("🚀 LeZeA MLOps Tracker Ready")
         print(f"   Experiment: {experiment_name}")
@@ -256,6 +264,19 @@ class ExperimentTracker:
             # Persist final results summary (per scope)
             _ = self._finalize_results_summary(log_to_backends=True)
 
+            # Persist data-usage summary
+            if self.data_usage:
+                try:
+                    summary = self.data_usage.summary()
+                    if self.backends.get("mlflow"):
+                        self.backends["mlflow"].log_dict(summary, "data_usage/summary.json")
+                    if self.backends.get("mongodb"):
+                        self.backends["mongodb"].store_results(
+                            self.experiment_id, {"kind": "data_usage_summary", **summary}
+                        )
+                except Exception:
+                    pass
+
             # Persist cost summary (if model available)
             if self.cost:
                 cost_summary = self.cost.summary()
@@ -331,8 +352,8 @@ class ExperimentTracker:
             if obj is None:
                 return False, "unavailable"
             if hasattr(obj, "ping"):
-                ok, msg = obj.ping(), "ok"
-                return (bool(ok), msg if isinstance(ok, str) else "ok")
+                ok = obj.ping()
+                return (bool(ok), "ok")
             if hasattr(obj, "available"):
                 return (bool(getattr(obj, "available")), "available flag")
             # Fallback: assume OK
@@ -466,9 +487,16 @@ class ExperimentTracker:
             self._scope_stack.pop()
 
     # ---------------------------
-    # Training — metrics & delta + resource/cost sampling
+    # Training — metrics & delta + resource/cost sampling + data-usage
     # ---------------------------
-    def log_training_step(self, step: int, episode: Optional[int] = None, **metrics: Any) -> None:
+    def log_training_step(
+        self,
+        step: int,
+        episode: Optional[int] = None,
+        sample_ids: Optional[List[str]] = None,
+        split: Optional[str] = None,
+        **metrics: Any
+    ) -> None:
         if not self.is_active:
             self.logger.warning("Experiment not active")
             return
@@ -481,6 +509,24 @@ class ExperimentTracker:
                 if self._last_loss is not None:
                     validated["delta_loss"] = float(validated["loss"]) - float(self._last_loss)
                 self._last_loss = float(validated["loss"])  # update
+
+            # Data-usage & learning relevance (optional)
+            if self.data_usage and sample_ids and split:
+                try:
+                    self.data_usage.update(sample_ids, split, delta_loss=validated.get("delta_loss"))
+                    usage_metrics = self.data_usage.get_split_metrics(split)
+                    if self.backends.get("mlflow"):
+                        prefixed_usage = self._prefix_metrics({f"data/usage/{split}/{k}": v for k, v in usage_metrics.items()})
+                        self.backends["mlflow"].log_metrics(prefixed_usage, step=step)
+                    # Occasionally persist top-k attribution
+                    if self.backends.get("mlflow") and (step % 200 == 0 or step < 10):
+                        topk = self.data_usage.top_k(split, k=25)
+                        self.backends["mlflow"].log_dict(
+                            {"split": split, "step": step, "top_relevant": topk},
+                            f"data_usage/{split}_top_relevant_step_{step}.json"
+                        )
+                except Exception:
+                    pass
 
             # Step timing
             if self._step_times:
@@ -506,6 +552,10 @@ class ExperimentTracker:
                     "metrics": validated,
                     "scope": self._current_scope() or {"level": "global", "entity_id": "-"},
                     "experiment_id": self.experiment_id,
+                    "data_usage": {
+                        "split": split,
+                        "batch_count": len(sample_ids) if sample_ids else 0,
+                    } if split else None,
                 }
                 self.backends["mongodb"].store_training_step(self.experiment_id, doc)
 
@@ -564,6 +614,12 @@ class ExperimentTracker:
                 self.backends["mlflow"].log_dict(info, "data_splits.json")
             if self.backends.get("mongodb"):
                 self.backends["mongodb"].store_data_splits(self.experiment_id, info)
+            # Feed totals to data-usage logger if enabled
+            if self.data_usage:
+                try:
+                    self.data_usage.set_split_totals({"train": int(train), "val": int(val), "test": int(test)})
+                except Exception:
+                    pass
             print("🧩 Logged data splits")
         except Exception as e:
             self.logger.error(f"Failed to log data splits: {e}")
