@@ -1,0 +1,345 @@
+# ==============================================================================
+# LeZeA MLOps - Services Configuration
+# Defines all external service endpoints, credentials, and settings
+# ==============================================================================
+
+# MLflow Configuration
+# Experiment tracking, model registry, and artifact storage
+mlflow:
+  # Service endpoints
+  url: "http://localhost:5000"
+  backend_store_uri: "postgresql://mlflow_user:mlflow_password123@localhost/mlflow_db"
+  default_artifact_root: "s3://lezea-mlops-artifacts"
+  
+  # Default experiment settings
+  default_experiment_name: "lezea_experiments"
+  auto_create_experiments: true
+  
+  # Tracking settings
+  tracking:
+    log_model_signatures: true
+    log_input_examples: true
+    log_model_artifacts: true
+    max_param_length: 500
+    max_tag_length: 5000
+  
+  # Model registry settings
+  model_registry:
+    default_stage: "None"
+    auto_transition_to_staging: false
+    require_approval_for_production: true
+  
+  # Artifact settings
+  artifacts:
+    max_file_size_mb: 1000
+    compression: true
+    parallel_uploads: true
+    retry_attempts: 3
+
+# MongoDB Configuration
+# Complex data storage (modification trees, resource stats, business metrics)
+mongodb:
+  # Connection settings
+  host: "localhost"
+  port: 27017
+  database: "lezea_mlops"
+  
+  # Authentication (optional)
+  username: null
+  password: null
+  auth_source: "admin"
+  
+  # Collection names
+  collections:
+    modifications: "modifications"        # Model modification trees
+    resources: "resources"              # Resource usage statistics
+    business: "business"                # Business metrics and costs
+    experiments: "experiments"          # Experiment metadata
+    datasets: "datasets"               # Dataset information
+    pipelines: "pipelines"             # Data processing pipelines
+  
+  # Connection options
+  connection:
+    server_selection_timeout_ms: 5000
+    socket_timeout_ms: 30000
+    max_pool_size: 100
+    retry_writes: true
+    w: "majority"
+  
+  # Indexing strategy
+  indexes:
+    # Common indexes for performance
+    experiments:
+      - ["experiment_id", 1]
+      - ["timestamp", -1]
+      - ["experiment_name", 1]
+    modifications:
+      - ["experiment_id", 1]
+      - ["step", 1]
+      - ["timestamp", -1]
+    resources:
+      - ["experiment_id", 1]
+      - ["component_type", 1]
+      - ["timestamp", -1]
+    business:
+      - ["experiment_id", 1]
+      - ["cost", -1]
+      - ["timestamp", -1]
+
+# PostgreSQL Configuration
+# MLflow metadata storage and structured data
+postgres:
+  # Connection settings
+  host: "localhost"
+  port: 5432
+  database: "mlflow_db"
+  user: "mlflow_user"
+  password: "mlflow_password123"
+  
+  # Connection pool settings
+  connection_pool:
+    min_connections: 1
+    max_connections: 20
+    connection_timeout: 30
+    idle_timeout: 600
+  
+  # Performance settings
+  performance:
+    statement_timeout: "30s"
+    lock_timeout: "10s"
+    maintenance_work_mem: "256MB"
+    shared_buffers: "256MB"
+  
+  # Backup settings
+  backup:
+    auto_backup: true
+    backup_retention_days: 30
+    backup_schedule: "0 2 * * *"  # Daily at 2 AM
+
+# AWS S3 Configuration
+# Large file storage (checkpoints, models, datasets)
+s3:
+  # Region and endpoints
+  region: "us-east-1"
+  endpoint_url: null  # Use default AWS endpoints
+  
+  # Bucket configuration
+  buckets:
+    artifacts: "lezea-mlops-artifacts"    # MLflow artifacts, logs, reports
+    data: "lezea-mlops-data"             # Raw and processed datasets
+    backups: "lezea-mlops-backups"       # System backups and archives
+    models: "lezea-mlops-models"         # Final trained models
+  
+  # Path prefixes for organization
+  prefixes:
+    checkpoints: "checkpoints/"
+    models: "models/"
+    datasets: "datasets/"
+    experiments: "experiments/"
+    logs: "logs/"
+    backups: "backups/"
+    temp: "temp/"
+  
+  # Upload settings
+  upload:
+    multipart_threshold: 64  # MB
+    multipart_chunksize: 16  # MB
+    max_concurrency: 10
+    use_threads: true
+    
+  # Transfer acceleration
+  transfer_acceleration: false
+  
+  # Storage classes
+  storage_classes:
+    default: "STANDARD"
+    archive: "GLACIER"
+    deep_archive: "DEEP_ARCHIVE"
+  
+  # Lifecycle policies
+  lifecycle:
+    temp_files_days: 7
+    logs_transition_days: 30
+    archive_transition_days: 90
+
+# DVC Configuration  
+# Dataset versioning and data pipeline management
+dvc:
+  # Remote storage settings
+  remote:
+    name: "s3-storage"
+    url: "s3://lezea-mlops-data/dvc-storage"
+    
+  # Cache settings
+  cache:
+    type: "s3"
+    s3_endpoint_url: null
+    s3_use_ssl: true
+    
+  # Performance settings
+  performance:
+    checksum_jobs: 4
+    upload_jobs: 4
+    download_jobs: 4
+  
+  # Data tracking
+  tracking:
+    auto_stage: false
+    auto_push: false
+    check_update: true
+
+# Prometheus Configuration
+# Metrics collection and monitoring
+prometheus:
+  # Service endpoints
+  url: "http://localhost:9090"
+  pushgateway: "http://localhost:9091"
+  
+  # Scrape settings
+  scrape:
+    interval: "15s"
+    timeout: "10s"
+    
+  # Metric retention
+  retention:
+    time: "15d"
+    size: "10GB"
+  
+  # Alert manager
+  alertmanager:
+    url: "http://localhost:9093"
+    
+  # Custom metrics configuration
+  custom_metrics:
+    # Training metrics
+    training_loss: 
+      type: "gauge"
+      help: "Current training loss"
+    training_accuracy:
+      type: "gauge" 
+      help: "Current training accuracy"
+    
+    # Resource metrics
+    gpu_utilization:
+      type: "gauge"
+      help: "GPU utilization percentage"
+    memory_usage:
+      type: "gauge"
+      help: "Memory usage in bytes"
+    
+    # System metrics
+    experiment_duration:
+      type: "histogram"
+      help: "Experiment duration in seconds"
+      buckets: [60, 300, 600, 1800, 3600, 7200, 14400]
+
+# Grafana Configuration
+# Dashboards and visualization
+grafana:
+  # Service settings
+  url: "http://localhost:3000"
+  user: "admin"
+  password: "admin"
+  
+  # Dashboard settings
+  dashboards:
+    auto_import: true
+    default_folder: "LeZeA MLOps"
+    
+  # Data source settings
+  datasources:
+    prometheus:
+      name: "Prometheus"
+      type: "prometheus"
+      url: "http://localhost:9090"
+      access: "proxy"
+      
+    mongodb:
+      name: "MongoDB"
+      type: "mongodb-datasource"
+      url: "mongodb://localhost:27017"
+      database: "lezea_mlops"
+  
+  # Alert settings
+  alerts:
+    notification_channels:
+      - name: "slack"
+        type: "slack"
+        settings:
+          webhook_url: "${SLACK_WEBHOOK_URL}"
+      - name: "email"
+        type: "email"
+        settings:
+          addresses: "${ALERT_EMAIL_ADDRESSES}"
+
+# Health Check Configuration
+# Service health monitoring
+health_checks:
+  # Health check intervals
+  intervals:
+    fast: 30      # seconds
+    normal: 60    # seconds
+    slow: 300     # seconds
+  
+  # Service health endpoints
+  endpoints:
+    mlflow: "/health"
+    prometheus: "/-/healthy"
+    grafana: "/api/health"
+  
+  # Timeouts
+  timeouts:
+    connection: 10    # seconds
+    response: 30      # seconds
+  
+  # Retry settings
+  retries:
+    max_attempts: 3
+    backoff_factor: 2
+    max_delay: 60
+
+# Logging Configuration
+# System and application logging
+logging:
+  # Log levels
+  levels:
+    root: "INFO"
+    mlflow: "WARNING"
+    boto3: "WARNING"
+    pymongo: "WARNING"
+    
+  # Log formats
+  formats:
+    console: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    file: "%(asctime)s [%(levelname)s] %(name)s [%(filename)s:%(lineno)d]: %(message)s"
+    
+  # Log rotation
+  rotation:
+    max_size: "10MB"
+    backup_count: 5
+    when: "midnight"
+    interval: 1
+
+# Security Configuration
+# Security settings and best practices
+security:
+  # SSL/TLS settings
+  ssl:
+    verify_certificates: true
+    min_tls_version: "1.2"
+    
+  # API security
+  api:
+    rate_limiting: true
+    max_requests_per_minute: 1000
+    require_authentication: false  # Set to true in production
+    
+  # Data encryption
+  encryption:
+    encrypt_at_rest: true
+    encrypt_in_transit: true
+    
+  # Access control
+  access_control:
+    enable_rbac: false  # Role-based access control
+    session_timeout: 3600  # seconds

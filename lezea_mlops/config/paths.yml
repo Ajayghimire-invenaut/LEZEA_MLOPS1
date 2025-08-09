@@ -1,0 +1,145 @@
+# ==============================================================================
+# LeZeA MLOps - Path Configuration
+# Defines all directory structures and file naming patterns
+# ==============================================================================
+
+# Directory structure for the MLOps system
+# All paths are relative to the project root unless absolute
+directories:
+  # Core directories
+  artifacts: "artifacts"           # MLflow artifacts storage (logs, plots, etc.)
+  data: "data"                    # Raw datasets (under DVC control)
+  logs: "logs"                    # Application and system logs
+  checkpoints: "checkpoints"      # Model checkpoints during training
+  models: "models"               # Final trained models
+  exports: "exports"             # Data exports and backups
+  
+  # Temporary and cache directories
+  temp: "temp"                   # Temporary files
+  cache: "cache"                 # Cached computations
+  
+  # Analysis and reporting
+  reports: "reports"             # Generated reports and analysis
+  visualizations: "viz"          # Plots, charts, and visualizations
+  
+  # Development and testing
+  tests_output: "tests/output"   # Test artifacts and results
+  benchmarks: "benchmarks"       # Performance benchmark results
+
+# File naming patterns with variable substitution
+# Use these patterns to ensure consistent file naming across the system
+patterns:
+  # Checkpoint patterns
+  checkpoint: "checkpoint_step_{step}_{timestamp}.pth"
+  checkpoint_with_metrics: "checkpoint_step_{step}_loss_{loss:.4f}_{timestamp}.pth"
+  
+  # Model patterns
+  model: "model_{type}_{experiment_id}_{timestamp}.pth"
+  final_model: "final_{type}_model_{experiment_name}_{timestamp}.pth"
+  
+  # Log patterns
+  experiment_log: "experiment_{experiment_id}_{timestamp}.log"
+  training_log: "training_{experiment_name}_{date}.log"
+  error_log: "errors_{date}.log"
+  
+  # Data patterns
+  dataset_version: "dataset_{name}_v{version}_{timestamp}"
+  processed_data: "processed_{dataset_name}_{processing_type}_{timestamp}"
+  
+  # Export patterns
+  experiment_export: "experiment_{experiment_id}_export_{timestamp}.json"
+  metrics_export: "metrics_{experiment_name}_{date_range}_{timestamp}.csv"
+  
+  # Report patterns
+  experiment_report: "report_{experiment_name}_{timestamp}.pdf"
+  performance_report: "performance_{experiment_id}_{timestamp}.html"
+  
+  # Visualization patterns
+  loss_plot: "loss_plot_{experiment_id}_{timestamp}.png"
+  metrics_dashboard: "dashboard_{experiment_name}_{timestamp}.html"
+
+# S3 key prefixes for cloud storage organization
+s3_prefixes:
+  # Experiment artifacts
+  experiments: "experiments/{experiment_id}/"
+  checkpoints: "checkpoints/{experiment_id}/"
+  final_models: "models/{model_type}/{experiment_id}/"
+  
+  # Data storage
+  datasets: "datasets/{dataset_name}/v{version}/"
+  processed_data: "processed/{dataset_name}/{processing_type}/"
+  
+  # Backups and archives
+  backups: "backups/{backup_type}/{date}/"
+  archives: "archives/{experiment_id}/"
+  
+  # Logs and monitoring
+  logs: "logs/{service}/{date}/"
+  metrics: "metrics/{experiment_id}/"
+
+# DVC remote storage paths
+dvc_paths:
+  remote_root: "dvc-storage"
+  datasets: "dvc-storage/datasets"
+  processed: "dvc-storage/processed"
+  models: "dvc-storage/models"
+  experiments: "dvc-storage/experiments"
+
+# Directory permissions and settings
+directory_settings:
+  # Create directories with these permissions (Unix systems)
+  default_permissions: "755"
+  
+  # Directories that should be git-ignored
+  git_ignore:
+    - "temp"
+    - "cache"
+    - "logs"
+    - "checkpoints"
+    - "*.log"
+    - "*.tmp"
+  
+  # Directories that need to exist for the system to work
+  required:
+    - "artifacts"
+    - "data"
+    - "logs"
+    - "checkpoints"
+    - "models"
+  
+  # Maximum sizes for different types of content (in MB)
+  size_limits:
+    single_checkpoint: 1000      # 1GB max for a single checkpoint
+    experiment_logs: 100         # 100MB max for experiment logs
+    visualization: 50            # 50MB max for a single visualization
+    temp_files: 500             # 500MB max for temp directory
+
+# File cleanup policies
+cleanup_policies:
+  # Automatic cleanup settings
+  temp_files_retention_days: 7      # Delete temp files after 7 days
+  log_files_retention_days: 30      # Keep logs for 30 days
+  checkpoint_retention_count: 10    # Keep last 10 checkpoints per experiment
+  
+  # File patterns to clean up automatically
+  auto_cleanup_patterns:
+    - "temp/*.tmp"
+    - "cache/*.cache"
+    - "logs/*.log.old"
+    - "checkpoints/*_backup.pth"
+
+# Path validation rules
+validation:
+  # File extensions that are allowed for different content types
+  allowed_extensions:
+    checkpoints: [".pth", ".pkl", ".ckpt", ".h5"]
+    datasets: [".csv", ".json", ".parquet", ".h5", ".npz"]
+    logs: [".log", ".txt"]
+    visualizations: [".png", ".jpg", ".pdf", ".html", ".svg"]
+    models: [".pth", ".pkl", ".onnx", ".pb", ".h5"]
+  
+  # Maximum filename length
+  max_filename_length: 255
+  
+  # Characters not allowed in filenames
+  forbidden_chars: ["<", ">", ":", "\"", "|", "?", "*"]

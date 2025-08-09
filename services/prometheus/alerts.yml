@@ -1,0 +1,491 @@
+# Prometheus Alert Rules for LeZeA MLOps
+# =======================================
+#
+# Comprehensive alerting rules for:
+# - Training performance and progress monitoring
+# - Resource utilization and capacity planning
+# - Service health and availability
+# - Data quality and pipeline issues
+# - Security and operational concerns
+
+groups:
+  # ========================================
+  # LeZeA Training Performance Alerts
+  # ========================================
+  
+  - name: lezea_training_performance
+    interval: 30s
+    rules:
+      # Training has stopped or stalled
+      - alert: TrainingStalled
+        expr: |
+          (
+            increase(lezea_training_steps_total[5m]) == 0
+            and
+            lezea_service_up{service_name="lezea-mlops"} == 1
+          )
+        for: 10m
+        labels:
+          severity: warning
+          component: training
+          team: ml-engineering
+        annotations:
+          summary: "LeZeA training appears to have stalled"
+          description: |
+            Training for experiment {{ $labels.experiment_id }} ({{ $labels.model_type }}) 
+            has not progressed in the last 10 minutes. No new training steps detected.
+            Current step count: {{ $value }}
+          runbook_url: "https://docs.lezea-mlops.com/runbooks/training-stalled"
+          dashboard_url: "http://localhost:3000/d/lezea-training/training-overview?var-experiment={{ $labels.experiment_id }}"
+
+      # Training loss is not decreasing
+      - alert: TrainingLossNotImproving
+        expr: |
+          (
+            lezea_current_loss{loss_type="training"} 
+            >= 
+            lezea_current_loss{loss_type="training"} offset 30m
+          )
+        for: 30m
+        labels:
+          severity: warning
+          component: training
+          team: ml-engineering
+        annotations:
+          summary: "Training loss not improving"
+          description: |
+            Training loss for experiment {{ $labels.experiment_id }} has not improved 
+            in the last 30 minutes. Current loss: {{ $value | humanize }}
+            This may indicate learning rate issues or model convergence problems.
+
+      # Gradient norm is exploding
+      - alert: GradientExplosion
+        expr: lezea_gradient_norm > 100
+        for: 2m
+        labels:
+          severity: critical
+          component: training
+          team: ml-engineering
+        annotations:
+          summary: "Gradient explosion detected"
+          description: |
+            Gradient norm for experiment {{ $labels.experiment_id }} is extremely high: {{ $value | humanize }}
+            This indicates gradient explosion which will destabilize training.
+            Consider reducing learning rate or implementing gradient clipping.
+
+      # Training throughput is very low
+      - alert: LowTrainingThroughput
+        expr: lezea_training_samples_per_second < 10
+        for: 15m
+        labels:
+          severity: warning
+          component: training
+          team: ml-engineering
+        annotations:
+          summary: "Training throughput is very low"
+          description: |
+            Training throughput for experiment {{ $labels.experiment_id }} is only {{ $value | humanize }} samples/sec.
+            This is significantly below expected performance and may indicate resource bottlenecks.
+
+      # Model accuracy dropping significantly
+      - alert: ModelAccuracyDegraded
+        expr: |
+          (
+            lezea_model_accuracy < 0.7
+            and
+            lezea_model_accuracy < (lezea_model_accuracy offset 1h) * 0.9
+          )
+        for: 10m
+        labels:
+          severity: warning
+          component: model-quality
+          team: ml-engineering
+        annotations:
+          summary: "Model accuracy has degraded significantly"
+          description: |
+            Model accuracy for experiment {{ $labels.experiment_id }} has dropped to {{ $value | humanizePercentage }}
+            This is a 10% or more decrease from 1 hour ago, indicating potential training issues.
+
+  # ========================================
+  # Resource Utilization Alerts
+  # ========================================
+  
+  - name: resource_utilization
+    interval: 30s
+    rules:
+      # High GPU utilization
+      - alert: HighGPUUtilization
+        expr: lezea_gpu_utilization_percent > 95
+        for: 10m
+        labels:
+          severity: warning
+          component: gpu
+          team: infrastructure
+        annotations:
+          summary: "GPU utilization is very high"
+          description: |
+            GPU {{ $labels.gpu_id }} ({{ $labels.gpu_name }}) utilization is {{ $value }}%
+            Sustained high GPU utilization may lead to thermal throttling or hardware stress.
+
+      # GPU memory exhaustion
+      - alert: GPUMemoryExhaustion
+        expr: (lezea_gpu_memory_used_bytes / lezea_gpu_memory_total_bytes) * 100 > 90
+        for: 5m
+        labels:
+          severity: critical
+          component: gpu
+          team: infrastructure
+        annotations:
+          summary: "GPU memory nearly exhausted"
+          description: |
+            GPU {{ $labels.gpu_id }} memory usage is {{ $value | humanizePercentage }}
+            Used: {{ $labels.gpu_memory_used_bytes | humanizeBytes }}
+            Total: {{ $labels.gpu_memory_total_bytes | humanizeBytes }}
+            Training may fail with out-of-memory errors.
+
+      # GPU temperature too high
+      - alert: GPUOverheating
+        expr: lezea_gpu_temperature_celsius > 85
+        for: 5m
+        labels:
+          severity: critical
+          component: gpu
+          team: infrastructure
+        annotations:
+          summary: "GPU temperature is dangerously high"
+          description: |
+            GPU {{ $labels.gpu_id }} temperature is {{ $value }}°C
+            This may cause thermal throttling or hardware damage.
+            Check cooling systems immediately.
+
+      # High CPU utilization
+      - alert: HighCPUUtilization
+        expr: lezea_cpu_utilization_percent > 90
+        for: 15m
+        labels:
+          severity: warning
+          component: cpu
+          team: infrastructure
+        annotations:
+          summary: "CPU utilization is very high"
+          description: |
+            CPU utilization is {{ $value }}% for the last 15 minutes.
+            This may indicate insufficient CPU resources or inefficient processing.
+
+      # Low system memory
+      - alert: LowSystemMemory
+        expr: (lezea_memory_available_bytes / lezea_memory_total_bytes) * 100 < 10
+        for: 5m
+        labels:
+          severity: critical
+          component: memory
+          team: infrastructure
+        annotations:
+          summary: "System memory is critically low"
+          description: |
+            Available system memory is only {{ $value | humanizePercentage }}
+            Available: {{ $labels.lezea_memory_available_bytes | humanizeBytes }}
+            Total: {{ $labels.lezea_memory_total_bytes | humanizeBytes }}
+            System may become unresponsive or kill processes.
+
+      # Disk space running low
+      - alert: LowDiskSpace
+        expr: (lezea_disk_used_bytes / lezea_disk_total_bytes) * 100 > 85
+        for: 10m
+        labels:
+          severity: warning
+          component: storage
+          team: infrastructure
+        annotations:
+          summary: "Disk space is running low"
+          description: |
+            Disk usage on {{ $labels.mount_point }} is {{ $value | humanizePercentage }}
+            Used: {{ $labels.lezea_disk_used_bytes | humanizeBytes }}
+            Total: {{ $labels.lezea_disk_total_bytes | humanizeBytes }}
+            Consider cleaning up old files or expanding storage.
+
+      # Disk space critically low
+      - alert: CriticalDiskSpace
+        expr: (lezea_disk_used_bytes / lezea_disk_total_bytes) * 100 > 95
+        for: 2m
+        labels:
+          severity: critical
+          component: storage
+          team: infrastructure
+        annotations:
+          summary: "Disk space is critically low"
+          description: |
+            Disk usage on {{ $labels.mount_point }} is {{ $value | humanizePercentage }}
+            Immediate action required to prevent system failures.
+
+  # ========================================
+  # Service Health Alerts
+  # ========================================
+  
+  - name: service_health
+    interval: 30s
+    rules:
+      # Service is down
+      - alert: ServiceDown
+        expr: lezea_service_up == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: service
+          team: platform
+        annotations:
+          summary: "{{ $labels.service_name }} service is down"
+          description: |
+            Service {{ $labels.service_name }} ({{ $labels.service_type }}) has been down for 2 minutes.
+            This may impact experiment tracking and data storage.
+
+      # Slow service response
+      - alert: SlowServiceResponse
+        expr: histogram_quantile(0.95, rate(lezea_service_response_seconds_bucket[5m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+          component: service
+          team: platform
+        annotations:
+          summary: "{{ $labels.service_name }} is responding slowly"
+          description: |
+            95th percentile response time for {{ $labels.service_name }} is {{ $value | humanizeDuration }}
+            This may indicate performance issues or resource constraints.
+
+      # High error rate
+      - alert: HighErrorRate
+        expr: |
+          (
+            rate(lezea_errors_total[5m]) > 0.1
+          )
+        for: 5m
+        labels:
+          severity: warning
+          component: application
+          team: platform
+        annotations:
+          summary: "High error rate detected"
+          description: |
+            Error rate for {{ $labels.component }} is {{ $value | humanize }} errors/second
+            Error type: {{ $labels.error_type }}
+            This indicates potential system instability.
+
+      # MLflow server issues
+      - alert: MLflowServerDown
+        expr: up{job="mlflow"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: mlflow
+          team: platform
+        annotations:
+          summary: "MLflow server is unreachable"
+          description: |
+            MLflow server at {{ $labels.instance }} is not responding.
+            Experiment tracking and model registry are unavailable.
+
+      # Database connection issues
+      - alert: DatabaseConnectionFailure
+        expr: up{job="postgresql"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: database
+          team: platform
+        annotations:
+          summary: "PostgreSQL database is unreachable"
+          description: |
+            PostgreSQL database is not responding. This will cause:
+            - MLflow metadata storage failures
+            - Experiment tracking disruption
+            - Analytics query failures
+
+  # ========================================
+  # Data Pipeline Alerts
+  # ========================================
+  
+  - name: data_pipeline
+    interval: 60s
+    rules:
+      # Data loading is slow
+      - alert: SlowDataLoading
+        expr: histogram_quantile(0.95, rate(lezea_data_loading_seconds_bucket[10m])) > 30
+        for: 10m
+        labels:
+          severity: warning
+          component: data-pipeline
+          team: data-engineering
+        annotations:
+          summary: "Data loading is unusually slow"
+          description: |
+            95th percentile data loading time for {{ $labels.dataset_name }} is {{ $value | humanizeDuration }}
+            This may indicate storage bottlenecks or network issues.
+
+      # Data quality score is low
+      - alert: LowDataQuality
+        expr: lezea_data_quality_score < 0.8
+        for: 15m
+        labels:
+          severity: warning
+          component: data-quality
+          team: data-engineering
+        annotations:
+          summary: "Data quality score is below threshold"
+          description: |
+            Data quality score for {{ $labels.dataset_name }} ({{ $labels.metric_type }}) is {{ $value | humanize }}
+            This may impact model training quality and performance.
+
+      # Dataset size changed significantly
+      - alert: DatasetSizeAnomalous
+        expr: |
+          (
+            abs(lezea_dataset_size_bytes - lezea_dataset_size_bytes offset 24h) 
+            / lezea_dataset_size_bytes offset 24h
+          ) > 0.2
+        for: 30m
+        labels:
+          severity: warning
+          component: data-pipeline
+          team: data-engineering
+        annotations:
+          summary: "Dataset size changed significantly"
+          description: |
+            Dataset {{ $labels.dataset_name }} size has changed by more than 20% in 24 hours.
+            Current: {{ $labels.lezea_dataset_size_bytes | humanizeBytes }}
+            This may indicate data pipeline issues or data corruption.
+
+  # ========================================
+  # System Security and Operational Alerts
+  # ========================================
+  
+  - name: security_operational
+    interval: 60s
+    rules:
+      # Too many failed experiments
+      - alert: HighExperimentFailureRate
+        expr: |
+          (
+            rate(lezea_experiments_total{status="failed"}[1h]) 
+            / 
+            rate(lezea_experiments_total[1h])
+          ) > 0.3
+        for: 30m
+        labels:
+          severity: warning
+          component: experiments
+          team: ml-engineering
+        annotations:
+          summary: "High experiment failure rate"
+          description: |
+            {{ $value | humanizePercentage }} of experiments are failing in the last hour.
+            This indicates potential system or configuration issues.
+
+      # Prometheus target down
+      - alert: PrometheusTargetDown
+        expr: up == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: monitoring
+          team: platform
+        annotations:
+          summary: "Prometheus target is down"
+          description: |
+            Prometheus target {{ $labels.job }}/{{ $labels.instance }} is down.
+            Monitoring data for this target is not being collected.
+
+      # High network usage
+      - alert: HighNetworkUsage
+        expr: |
+          (
+            rate(lezea_network_bytes_sent_total[5m]) + 
+            rate(lezea_network_bytes_received_total[5m])
+          ) > 100 * 1024 * 1024  # 100MB/s
+        for: 10m
+        labels:
+          severity: warning
+          component: network
+          team: infrastructure
+        annotations:
+          summary: "High network utilization detected"
+          description: |
+            Network interface {{ $labels.interface }} is using {{ $value | humanizeBytes }}/s
+            This may indicate data transfer bottlenecks or unusual network activity.
+
+      # Prometheus rule evaluation slow
+      - alert: PrometheusRuleEvaluationSlow
+        expr: prometheus_rule_evaluation_duration_seconds{quantile="0.9"} > 30
+        for: 5m
+        labels:
+          severity: warning
+          component: monitoring
+          team: platform
+        annotations:
+          summary: "Prometheus rule evaluation is slow"
+          description: |
+            Prometheus rule evaluation is taking {{ $value | humanizeDuration }} (90th percentile).
+            This may indicate resource constraints or complex queries.
+
+  # ========================================
+  # Capacity Planning Alerts
+  # ========================================
+  
+  - name: capacity_planning
+    interval: 300s  # 5 minutes
+    rules:
+      # Predict GPU memory exhaustion
+      - alert: GPUMemoryExhaustionPredicted
+        expr: |
+          predict_linear(lezea_gpu_memory_used_bytes[30m], 3600) 
+          > 
+          lezea_gpu_memory_total_bytes * 0.95
+        for: 15m
+        labels:
+          severity: warning
+          component: capacity-planning
+          team: infrastructure
+        annotations:
+          summary: "GPU memory exhaustion predicted within 1 hour"
+          description: |
+            Based on current trends, GPU {{ $labels.gpu_id }} memory will be exhausted within 1 hour.
+            Current usage: {{ $labels.lezea_gpu_memory_used_bytes | humanizeBytes }}
+            Consider optimizing memory usage or scaling resources.
+
+      # Predict disk space exhaustion
+      - alert: DiskSpaceExhaustionPredicted
+        expr: |
+          predict_linear(lezea_disk_used_bytes[1h], 24 * 3600) 
+          > 
+          lezea_disk_total_bytes * 0.95
+        for: 30m
+        labels:
+          severity: warning
+          component: capacity-planning
+          team: infrastructure
+        annotations:
+          summary: "Disk space exhaustion predicted within 24 hours"
+          description: |
+            Based on current growth trends, disk {{ $labels.mount_point }} will be full within 24 hours.
+            Current usage: {{ $labels.lezea_disk_used_bytes | humanizeBytes }}
+            Plan for storage expansion or cleanup.
+
+      # Training completion time prediction
+      - alert: TrainingCompletionDelayed
+        expr: |
+          (
+            lezea_training_epochs_total < 10
+            and
+            predict_linear(lezea_training_epochs_total[1h], 24 * 3600) < 100
+          )
+        for: 1h
+        labels:
+          severity: info
+          component: capacity-planning
+          team: ml-engineering
+        annotations:
+          summary: "Training completion may be significantly delayed"
+          description: |
+            Based on current progress, experiment {{ $labels.experiment_id }} may not complete training 
+            for another {{ $value | humanizeDuration }} at the current rate.
+            Consider optimizing training parameters or resource allocation.
