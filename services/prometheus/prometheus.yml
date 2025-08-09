@@ -1,161 +1,80 @@
 # Prometheus Configuration for LeZeA MLOps
-# ==========================================
-#
-# This configuration monitors all components of the LeZeA MLOps stack:
-# - LeZeA training metrics and performance
-# - System resources (CPU, Memory, GPU, Disk, Network)
-# - Service health (MLflow, MongoDB, PostgreSQL, S3)
-# - Custom application metrics
-# - Node exporter for system metrics
-# - GPU exporter for NVIDIA GPU monitoring
 
-# Global configuration
 global:
-  # How frequently to scrape targets by default
   scrape_interval: 15s
-  
-  # How long until a scrape request times out
   scrape_timeout: 10s
-  
-  # How frequently to evaluate rules
   evaluation_interval: 15s
-  
-  # Attach these labels to any time series or alerts when communicating with
-  # external systems (federation, remote storage, Alertmanager)
   external_labels:
     cluster: 'lezea-mlops'
     environment: 'production'
     datacenter: 'local'
 
-# Alertmanager configuration (optional - uncomment if using Alertmanager)
 # alerting:
 #   alertmanagers:
 #     - static_configs:
-#         - targets:
-#           - "localhost:9093"
+#         - targets: ["localhost:9093"]
 
-# Rule files configuration
 rule_files:
   - "alerts.yml"
-  - "recording_rules.yml"
+  #- "recording_rules.yml"
 
-# Remote write configuration (optional - for long-term storage)
-# remote_write:
-#   - url: "http://localhost:9201/write"
-#     queue_config:
-#       max_samples_per_send: 1000
-#       max_shards: 200
-#       capacity: 2500
-
-# Scrape configuration
 scrape_configs:
-  # ========================================
-  # LeZeA MLOps Application Metrics
-  # ========================================
-  
-  # LeZeA MLOps main application metrics
+  # LeZeA app
   - job_name: 'lezea-mlops'
-    static_configs:
-      - targets: ['localhost:8000']
+    static_configs: [{ targets: ['localhost:8000'] }]
     scrape_interval: 5s
     scrape_timeout: 5s
     metrics_path: '/metrics'
     honor_labels: true
-    params:
-      format: ['prometheus']
-    relabel_configs:
-      - source_labels: [__address__]
-        target_label: __param_target
-      - source_labels: [__param_target]
-        target_label: instance
-      - target_label: __address__
-        replacement: localhost:8000
+    params: { format: ['prometheus'] }
     metric_relabel_configs:
-      # Add experiment context to all LeZeA metrics
+    
       - source_labels: [__name__]
         regex: 'lezea_.*'
         target_label: component
         replacement: 'lezea-mlops'
 
-  # ========================================
-  # Infrastructure Services
-  # ========================================
-  
-  # Prometheus self-monitoring
+  # Prometheus self
   - job_name: 'prometheus'
-    static_configs:
-      - targets: ['localhost:9090']
-    scrape_interval: 15s
+    static_configs: [{ targets: ['localhost:9090'] }]
     metrics_path: '/metrics'
 
-  # Node Exporter (system metrics)
+  # Node exporter
   - job_name: 'node-exporter'
-    static_configs:
-      - targets: ['localhost:9100']
-    scrape_interval: 15s
+    static_configs: [{ targets: ['localhost:9100'] }]
     metrics_path: '/metrics'
-    relabel_configs:
-      - source_labels: [__address__]
-        regex: '([^:]+)(?::\d+)?'
-        target_label: instance
-        replacement: '${1}'
 
-  # GPU Metrics (NVIDIA GPU monitoring)
+  # NVIDIA GPU exporter (optional)
   - job_name: 'nvidia-gpu'
-    static_configs:
-      - targets: ['localhost:9835']  # nvidia_gpu_exporter
-    scrape_interval: 10s
+    static_configs: [{ targets: ['localhost:9835'] }]
     metrics_path: '/metrics'
     honor_labels: true
 
-  # ========================================
-  # MLOps Services
-  # ========================================
-  
-  # MLflow Server
+  # MLflow
   - job_name: 'mlflow'
-    static_configs:
-      - targets: ['localhost:5000']
+    static_configs: [{ targets: ['localhost:5000'] }]
     scrape_interval: 30s
     metrics_path: '/metrics'
-    params:
-      format: ['prometheus']
+    params: { format: ['prometheus'] }
     metric_relabel_configs:
       - source_labels: [__name__]
         regex: 'mlflow_.*'
         target_label: service
         replacement: 'mlflow'
 
-  # PostgreSQL metrics (using postgres_exporter)
+  # PostgreSQL exporter (optional)
   - job_name: 'postgresql'
-    static_configs:
-      - targets: ['localhost:9187']
-    scrape_interval: 30s
+    static_configs: [{ targets: ['localhost:9187'] }]
     metrics_path: '/metrics'
-    relabel_configs:
-      - source_labels: [__address__]
-        target_label: instance
-        replacement: 'postgresql-main'
 
-  # MongoDB metrics (using mongodb_exporter)
+  # MongoDB exporter (optional)
   - job_name: 'mongodb'
-    static_configs:
-      - targets: ['localhost:9216']
-    scrape_interval: 30s
+    static_configs: [{ targets: ['localhost:9216'] }]
     metrics_path: '/metrics'
-    relabel_configs:
-      - source_labels: [__address__]
-        target_label: instance
-        replacement: 'mongodb-main'
 
-  # ========================================
-  # Storage Services
-  # ========================================
-  
-  # MinIO/S3 metrics (if using local MinIO)
+  # MinIO (optional)
   - job_name: 'minio'
-    static_configs:
-      - targets: ['localhost:9000']
+    static_configs: [{ targets: ['localhost:9000'] }]
     scrape_interval: 30s
     metrics_path: '/minio/v2/metrics/cluster'
     scheme: http
@@ -166,95 +85,26 @@ scrape_configs:
         target_label: service
         replacement: 'minio'
 
-  # ========================================
-  # Application-Specific Monitoring
-  # ========================================
-  
-  # Python application metrics (if using prometheus_client in your training scripts)
+  # Training processes via file_sd (optional)
   - job_name: 'training-processes'
     file_sd_configs:
-      - files:
-        - 'training_targets.json'
+      - files: ['training_targets.json']
         refresh_interval: 30s
     scrape_interval: 10s
     metrics_path: '/metrics'
-    relabel_configs:
-      - source_labels: [__meta_filepath]
-        target_label: config_file
-      - source_labels: [job]
-        target_label: training_job
     metric_relabel_configs:
-      # Filter out high-cardinality metrics if needed
       - source_labels: [__name__]
         regex: 'python_gc_.*'
         action: drop
 
-  # ========================================
-  # Health Check Endpoints
-  # ========================================
-  
-  # Custom health check monitoring
-  - job_name: 'health-checks'
-    static_configs:
-      - targets:
-        - 'localhost:5000'    # MLflow
-        - 'localhost:27017'   # MongoDB
-        - 'localhost:5432'    # PostgreSQL
-        - 'localhost:9000'    # MinIO
-    scrape_interval: 60s
-    metrics_path: '/health'
-    scheme: http
-    relabel_configs:
-      - source_labels: [__address__]
-        regex: 'localhost:(\d+)'
-        target_label: port
-        replacement: '${1}'
-      - source_labels: [port]
-        regex: '5000'
-        target_label: service
-        replacement: 'mlflow'
-      - source_labels: [port]
-        regex: '27017'
-        target_label: service
-        replacement: 'mongodb'
-      - source_labels: [port]
-        regex: '5432'
-        target_label: service
-        replacement: 'postgresql'
-      - source_labels: [port]
-        regex: '9000'
-        target_label: service
-        replacement: 'minio'
-
-  # ========================================
-  # Blackbox Monitoring
-  # ========================================
-  
-  # External endpoint monitoring (using blackbox_exporter)
+  # Blackbox exporter (optional)
   - job_name: 'blackbox-http'
     metrics_path: /probe
-    params:
-      module: [http_2xx]  # Look for a HTTP 200 response
+    params: { module: [http_2xx] }
     static_configs:
       - targets:
-        - http://localhost:5000/health    # MLflow health
-        - http://localhost:8000/health    # LeZeA MLOps health
-    relabel_configs:
-      - source_labels: [__address__]
-        target_label: __param_target
-      - source_labels: [__param_target]
-        target_label: instance
-      - target_label: __address__
-        replacement: localhost:9115  # Blackbox exporter address
-
-  - job_name: 'blackbox-tcp'
-    metrics_path: /probe
-    params:
-      module: [tcp_connect]
-    static_configs:
-      - targets:
-        - localhost:5432   # PostgreSQL
-        - localhost:27017  # MongoDB
+        - http://localhost:5000/health
+        - http://localhost:8000/health
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target
@@ -263,78 +113,17 @@ scrape_configs:
       - target_label: __address__
         replacement: localhost:9115
 
-  # ========================================
-  # Custom Exporters
-  # ========================================
-  
-  # Custom LeZeA training metrics exporter
-  - job_name: 'lezea-training-exporter'
+  - job_name: 'blackbox-tcp'
+    metrics_path: /probe
+    params: { module: [tcp_connect] }
     static_configs:
-      - targets: ['localhost:8001']
-    scrape_interval: 5s
-    honor_timestamps: true
-    metrics_path: '/training-metrics'
-    params:
-      format: ['prometheus']
-
-  # Custom dataset metrics exporter
-  - job_name: 'dataset-metrics'
-    static_configs:
-      - targets: ['localhost:8002']
-    scrape_interval: 60s
-    metrics_path: '/dataset-metrics'
-
-# Storage configuration
-storage:
-  tsdb:
-    # Data retention period
-    retention.time: 90d
-    
-    # Maximum size of storage
-    retention.size: 50GB
-    
-    # Compression settings
-    wal-compression: true
-    
-    # Block duration for TSDB
-    min-block-duration: 2h
-    max-block-duration: 25h
-
-# Web configuration
-web:
-  # Maximum number of concurrent queries
-  max-connections: 512
-  
-  # Read timeout
-  read-timeout: 5m
-  
-  # Enable admin API
-  enable-admin-api: true
-  
-  # Console libraries and templates
-  console.libraries: /etc/prometheus/console_libraries
-  console.templates: /etc/prometheus/consoles
-  
-  # External URL (for links in alerts)
-  external-url: http://localhost:9090
-
-# Query engine configuration  
-query:
-  # Maximum number of samples a single query can load
-  max-samples: 50000000
-  
-  # Maximum time a query may take before being aborted
-  timeout: 2m
-  
-  # Maximum number of queries executed concurrently
-  max-concurrency: 20
-
-# Remote read configuration (optional)
-# remote_read:
-#   - url: "http://localhost:9201/read"
-#     read_recent: true
-
-# Tracing configuration (optional - for debugging)
-# tracing:
-#   endpoint: "localhost:14268"
-#   sampling_fraction: 0.1
+      - targets:
+        - localhost:5432
+        - localhost:27017
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: localhost:9115

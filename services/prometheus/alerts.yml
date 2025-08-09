@@ -139,8 +139,8 @@ groups:
           summary: "GPU memory nearly exhausted"
           description: |
             GPU {{ $labels.gpu_id }} memory usage is {{ $value | humanizePercentage }}
-            Used: {{ $labels.gpu_memory_used_bytes | humanizeBytes }}
-            Total: {{ $labels.gpu_memory_total_bytes | humanizeBytes }}
+            Used: {{ $labels.gpu_memory_used_bytes | humanize }}
+            Total: {{ $labels.gpu_memory_total_bytes | humanize }}
             Training may fail with out-of-memory errors.
 
       # GPU temperature too high
@@ -184,8 +184,8 @@ groups:
           summary: "System memory is critically low"
           description: |
             Available system memory is only {{ $value | humanizePercentage }}
-            Available: {{ $labels.lezea_memory_available_bytes | humanizeBytes }}
-            Total: {{ $labels.lezea_memory_total_bytes | humanizeBytes }}
+            Available: {{ $labels.lezea_memory_available_bytes | humanize }}
+            Total: {{ $labels.lezea_memory_total_bytes | humanize }}
             System may become unresponsive or kill processes.
 
       # Disk space running low
@@ -200,8 +200,8 @@ groups:
           summary: "Disk space is running low"
           description: |
             Disk usage on {{ $labels.mount_point }} is {{ $value | humanizePercentage }}
-            Used: {{ $labels.lezea_disk_used_bytes | humanizeBytes }}
-            Total: {{ $labels.lezea_disk_total_bytes | humanizeBytes }}
+            Used: {{ $labels.lezea_disk_used_bytes | humanize }}
+            Total: {{ $labels.lezea_disk_total_bytes | humanize }}
             Consider cleaning up old files or expanding storage.
 
       # Disk space critically low
@@ -352,7 +352,7 @@ groups:
           summary: "Dataset size changed significantly"
           description: |
             Dataset {{ $labels.dataset_name }} size has changed by more than 20% in 24 hours.
-            Current: {{ $labels.lezea_dataset_size_bytes | humanizeBytes }}
+            Current: {{ $labels.lezea_dataset_size_bytes | humanize }}
             This may indicate data pipeline issues or data corruption.
 
   # ========================================
@@ -410,7 +410,7 @@ groups:
         annotations:
           summary: "High network utilization detected"
           description: |
-            Network interface {{ $labels.interface }} is using {{ $value | humanizeBytes }}/s
+            Network interface {{ $labels.interface }} is using {{ $value | humanize }}/s
             This may indicate data transfer bottlenecks or unusual network activity.
 
       # Prometheus rule evaluation slow
@@ -449,7 +449,7 @@ groups:
           summary: "GPU memory exhaustion predicted within 1 hour"
           description: |
             Based on current trends, GPU {{ $labels.gpu_id }} memory will be exhausted within 1 hour.
-            Current usage: {{ $labels.lezea_gpu_memory_used_bytes | humanizeBytes }}
+            Current usage: {{ $labels.lezea_gpu_memory_used_bytes | humanize }}
             Consider optimizing memory usage or scaling resources.
 
       # Predict disk space exhaustion
@@ -467,7 +467,7 @@ groups:
           summary: "Disk space exhaustion predicted within 24 hours"
           description: |
             Based on current growth trends, disk {{ $labels.mount_point }} will be full within 24 hours.
-            Current usage: {{ $labels.lezea_disk_used_bytes | humanizeBytes }}
+            Current usage: {{ $labels.lezea_disk_used_bytes | humanize }}
             Plan for storage expansion or cleanup.
 
       # Training completion time prediction

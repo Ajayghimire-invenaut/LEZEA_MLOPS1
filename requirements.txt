@@ -8,6 +8,7 @@ psycopg2-binary==2.9.9
 dvc[s3]==3.32.0
 
 # System monitoring
+py
 psutil==5.9.6
 GPUtil==1.4.0
 pynvml==11.5.0

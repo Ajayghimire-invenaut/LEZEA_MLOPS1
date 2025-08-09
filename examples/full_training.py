@@ -3,17 +3,18 @@
 LeZeA MLOps - Complete Training Example
 ======================================
 
-Comprehensive example showing all LeZeA MLOps features:
-- Advanced experiment configuration
-- Comprehensive logging and monitoring
-- Resource tracking and optimization
-- Model versioning and deployment
-- Integration with all backends
-
-This is the complete example Marcus can use as a template for production training.
+A realistic, end-to-end example that exercises LeZeA MLOps:
+- Experiment setup & rich configuration logging
+- Environment tagging (hardware, OS, Python, packages)
+- DVC dataset versioning
+- GPU/system monitoring + Prometheus metrics
+- Training/validation simulation with checkpoints, early stopping
+- Final evaluation + report artifact + optional model registry
 
 Usage:
-    python examples/full_training.py [--config config.yaml] [--experiment-name NAME]
+  python lezea_mlops/examples/full_training.py \
+      [--config config.yaml] [--experiment-name NAME] [--epochs N] \
+      [--batch-size N] [--learning-rate LR]
 """
 
 import os
@@ -26,1342 +27,626 @@ import tempfile
 import numpy as np
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any, Optional
 
 # Add project root to path
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# --- LeZeA imports (your modules) -------------------------------------------
 from lezea_mlops import ExperimentTracker
 from lezea_mlops.monitoring import get_metrics, GPUMonitor, EnvironmentTagger
 
+
 class LeZeATrainingExample:
     """Complete LeZeA training example with all features"""
-    
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.tracker = None
-        self.metrics_collector = None
-        self.gpu_monitor = None
-        
+        self.tracker: Optional[ExperimentTracker] = None
+        self.metrics = None  # Prometheus collector
+        self.gpu_monitor: Optional[GPUMonitor] = None
+
+    # ---------------------- Setup ------------------------------------------------
     def setup_experiment(self):
-        """Initialize experiment tracking and monitoring"""
         print("🔧 Setting up experiment...")
-        
-        # Initialize experiment tracker with advanced configuration
+
         self.tracker = ExperimentTracker(
             experiment_name=self.config['experiment']['name'],
             description=self.config['experiment']['description'],
             tags=self.config['experiment'].get('tags', {}),
-            create_if_not_exists=True
+            create_if_not_exists=True,
         )
-        
-        # Initialize metrics collection
-        self.metrics_collector = get_metrics()
-        
-        # Initialize GPU monitoring if available
+
+        # Prometheus metrics
         try:
-            self.gpu_monitor = GPUMonitor()
+            self.metrics = get_metrics()
+        except Exception as e:
+            print(f"⚠️  Prometheus metrics unavailable: {e}")
+            self.metrics = None
+
+        # GPU monitoring (runs on demand; can also start background loop if you like)
+        try:
+            self.gpu_monitor = GPUMonitor(sampling_interval=1.0, history_size=2000)
             print("✅ GPU monitoring initialized")
         except Exception as e:
             print(f"⚠️  GPU monitoring unavailable: {e}")
             self.gpu_monitor = None
-        
-        # Log environment information
+
+        # Environment info + MLflow-compatible tags
         env_tagger = EnvironmentTagger()
-        env_info = env_tagger.get_complete_environment()
-        self.tracker.log_environment_info(env_info)
-        
+        env_info = env_tagger.get_environment_info()
+        env_tags = env_tagger.get_mlflow_tags(env_info)
+
+        if hasattr(self.tracker, "log_environment_info"):
+            self.tracker.log_environment_info(env_info)
+        else:
+            # fallback: at least store a few vital bits
+            self.tracker.log_params({
+                "env.platform": env_info.get("system", {}).get("platform"),
+                "env.arch": env_info.get("system", {}).get("architecture"),
+            })
+
+        # also set tags if tracker supports it
+        if hasattr(self.tracker, "set_tags"):
+            self.tracker.set_tags(env_tags)
+        else:
+            # conservative fallback to params
+            self.tracker.log_params({f"env_tag.{k}": v for k, v in env_tags.items()})
+
         print(f"✅ Experiment '{self.tracker.experiment_name}' initialized")
         print(f"📊 Run ID: {self.tracker.run_id}")
-        print(f"🌐 MLflow UI: http://localhost:5000")
-        
+        print("🌐 MLflow UI: http://localhost:5000")
+
+    # ---------------------- Config logging --------------------------------------
     def log_configuration(self):
-        """Log complete experiment configuration"""
         print("📝 Logging experiment configuration...")
-        
-        # Log hyperparameters
+
+        # Hyperparameters, model, data basics
         self.tracker.log_params(self.config['model']['hyperparameters'])
-        
-        # Log model architecture
-        self.tracker.log_model_architecture(self.config['model']['architecture'])
-        
-        # Log dataset information
-        self.tracker.log_dataset_info(self.config['data'])
-        
-        # Log training configuration
-        training_config = {
+
+        if hasattr(self.tracker, "log_model_architecture"):
+            self.tracker.log_model_architecture(self.config['model']['architecture'])
+        else:
+            self.tracker.log_params({
+                f"model.arch.{k}": v for k, v in self.config['model']['architecture'].items()
+            })
+
+        if hasattr(self.tracker, "log_dataset_info"):
+            self.tracker.log_dataset_info(self.config['data'])
+        else:
+            self.tracker.log_params({
+                f"data.{k}": v for k, v in self.config['data'].items() if not isinstance(v, (list, dict))
+            })
+
+        training_cfg = {
             'optimizer': self.config['training']['optimizer'],
             'scheduler': self.config['training'].get('scheduler', {}),
             'regularization': self.config['training'].get('regularization', {}),
-            'early_stopping': self.config['training'].get('early_stopping', {})
+            'early_stopping': self.config['training'].get('early_stopping', {}),
         }
-        self.tracker.log_params(training_config)
-        
+        self.tracker.log_params(training_cfg)
         print("✅ Configuration logged")
-    
+
+    # ---------------------- Data loading (simulated) ----------------------------
     def simulate_data_loading(self) -> Dict[str, Any]:
-        """Simulate data loading with monitoring"""
         print("📊 Loading and preparing data...")
-        
-        data_config = self.config['data']
-        
-        # Simulate data loading time
-        load_time = np.random.uniform(2.0, 5.0)
+
+        data_cfg = self.config['data']
+        load_time = float(np.random.uniform(2.0, 5.0))
         time.sleep(load_time)
-        
-        # Create simulated dataset metadata
+
         dataset_info = {
-            'name': data_config['dataset_name'],
-            'version': data_config['version'],
-            'train_samples': data_config['train_samples'],
-            'val_samples': data_config['val_samples'],
-            'test_samples': data_config['test_samples'],
-            'features': data_config['features'],
-            'preprocessing': data_config['preprocessing'],
-            'load_time_seconds': load_time
+            'name': data_cfg['dataset_name'],
+            'version': data_cfg['version'],
+            'train_samples': int(data_cfg['train_samples']),
+            'val_samples': int(data_cfg['val_samples']),
+            'test_samples': int(data_cfg['test_samples']),
+            'features': int(data_cfg['features']),
+            'preprocessing': data_cfg['preprocessing'],
+            'load_time_seconds': load_time,
         }
-        
-        # Log dataset metrics
-        self.tracker.log_dataset_metrics({
-            'dataset_size_gb': data_config['size_gb'],
-            'data_quality_score': 0.95,
-            'missing_values_percent': 0.02,
-            'data_loading_time': load_time
-        })
-        
-        # Register dataset version with DVC
+
+        if hasattr(self.tracker, "log_dataset_metrics"):
+            self.tracker.log_dataset_metrics({
+                'dataset_size_gb': data_cfg['size_gb'],
+                'data_quality_score': 0.95,
+                'missing_values_percent': 0.02,
+                'data_loading_time': load_time,
+            })
+
+        # DVC dataset versioning (aligns with your DVCBackend API)
         try:
-            self.tracker.dvc_backend.track_dataset(
-                dataset_name=data_config['dataset_name'],
-                version=data_config['version'],
-                file_path=f"data/{data_config['dataset_name']}.parquet",
-                metadata=dataset_info
-            )
-            print("✅ Dataset version tracked with DVC")
+            if hasattr(self.tracker, "dvc_backend") and self.tracker.dvc_backend and self.tracker.dvc_backend.available:
+                data_path = str(PROJECT_ROOT / "data" / f"{data_cfg['dataset_name']}.parquet")
+                Path(data_path).parent.mkdir(parents=True, exist_ok=True)
+                # create a dummy file if missing
+                if not Path(data_path).exists():
+                    Path(data_path).write_text("lezea-demo-data\n")
+
+                version_info = self.tracker.dvc_backend.version_dataset(
+                    experiment_id=self.tracker.run_id,
+                    dataset_name=data_cfg['dataset_name'],
+                    data_paths=[data_path],
+                    description=f"Dataset {data_cfg['dataset_name']} v{data_cfg['version']}",
+                )
+                # keep a record
+                if hasattr(self.tracker, "log_params"):
+                    self.tracker.log_params({"dvc.version_tag": version_info.get("version_tag", "unknown")})
+                print("✅ Dataset versioned with DVC")
         except Exception as e:
-            print(f"⚠️  DVC tracking failed: {e}")
-        
+            print(f"⚠️  DVC versioning failed: {e}")
+
         print(f"✅ Data loaded: {dataset_info['train_samples']:,} train, "
-              f"{dataset_info['val_samples']:,} validation, "
-              f"{dataset_info['test_samples']:,} test samples")
-        
+              f"{dataset_info['val_samples']:,} val, "
+              f"{dataset_info['test_samples']:,} test")
         return dataset_info
-    
+
+    # ---------------------- Model init (simulated) ------------------------------
     def simulate_model_initialization(self) -> Dict[str, Any]:
-        """Simulate model initialization with architecture logging"""
         print("🧠 Initializing model...")
-        
-        model_config = self.config['model']
-        
-        # Simulate model creation time
-        init_time = np.random.uniform(1.0, 3.0)
+        arch = self.config['model']['architecture']
+        init_time = float(np.random.uniform(1.0, 3.0))
         time.sleep(init_time)
-        
-        # Calculate model parameters
-        architecture = model_config['architecture']
+
         total_params = (
-            architecture['hidden_size'] * architecture['vocab_size'] +  # Embedding
-            architecture['num_layers'] * architecture['hidden_size'] * architecture['hidden_size'] * 4 +  # Transformer layers
-            architecture['hidden_size'] * architecture['vocab_size']  # Output layer
+            arch['hidden_size'] * arch['vocab_size'] +                                  # embeddings
+            arch['num_layers'] * arch['hidden_size'] * arch['hidden_size'] * 4 +        # transformer blocks
+            arch['hidden_size'] * arch['vocab_size']                                     # output
         )
-        
+
         model_info = {
-            'total_parameters': total_params,
-            'trainable_parameters': int(total_params * 0.95),  # Some frozen params
-            'model_size_mb': total_params * 4 / (1024 * 1024),  # Assuming float32
+            'total_parameters': int(total_params),
+            'trainable_parameters': int(total_params * 0.95),
+            'model_size_mb': (total_params * 4) / (1024 * 1024),  # float32
             'initialization_time': init_time,
-            'architecture_type': architecture['type']
+            'architecture_type': arch['type'],
         }
-        
-        # Log model information
-        self.tracker.log_model_info(model_info)
-        
-        # Log to Prometheus if available
-        if self.metrics_collector:
-            self.metrics_collector.record_model_metrics(
+
+        if hasattr(self.tracker, "log_model_info"):
+            self.tracker.log_model_info(model_info)
+        else:
+            self.tracker.log_params({f"model.{k}": v for k, v in model_info.items()})
+
+        # seed Prometheus model metrics row (optional)
+        if self.metrics:
+            self.metrics.record_model_metrics(
                 experiment_id=self.tracker.run_id,
-                model_type=architecture['type']
+                model_type=arch['type'],
             )
-        
-        print(f"✅ Model initialized: {total_params:,} parameters ({model_info['model_size_mb']:.1f} MB)")
-        
+
+        print(f"✅ Model initialized: {model_info['total_parameters']:,} params "
+              f"({model_info['model_size_mb']:.1f} MB)")
         return model_info
-    
-    def simulate_training_loop(self, dataset_info: Dict[str, Any], model_info: Dict[str, Any]):
-        """Simulate complete training loop with comprehensive monitoring"""
+
+    # ---------------------- Training loop (simulated) ---------------------------
+    def simulate_training_loop(self, dataset_info: Dict[str, Any], model_info: Dict[str, Any]) -> float:
         print("🚀 Starting training loop...")
-        
-        training_config = self.config['training']
-        num_epochs = training_config['epochs']
-        batch_size = self.config['model']['hyperparameters']['batch_size']
-        learning_rate = self.config['model']['hyperparameters']['learning_rate']
-        
-        # Calculate steps per epoch
-        steps_per_epoch = dataset_info['train_samples'] // batch_size
-        total_steps = num_epochs * steps_per_epoch
-        
-        print(f"📈 Training for {num_epochs} epochs, {steps_per_epoch} steps/epoch, {total_steps} total steps")
-        
-        # Training state
-        best_val_accuracy = 0.0
-        no_improvement_count = 0
+
+        tr_cfg = self.config['training']
+        hp = self.config['model']['hyperparameters']
+        epochs = int(tr_cfg['epochs'])
+        batch_size = int(hp['batch_size'])
+        learning_rate = float(hp['learning_rate'])
+
+        steps_per_epoch = max(1, dataset_info['train_samples'] // batch_size)
+        total_steps = epochs * steps_per_epoch
+        print(f"📈 Training for {epochs} epochs, {steps_per_epoch} steps/epoch, {total_steps} total steps")
+
+        best_val_acc = 0.0
+        no_improve = 0
         global_step = 0
-        
-        for epoch in range(num_epochs):
-            epoch_start_time = time.time()
-            print(f"\n🔄 Epoch {epoch + 1}/{num_epochs}")
-            
-            # Training phase
-            epoch_metrics = self._simulate_epoch(
+
+        for epoch in range(epochs):
+            e_start = time.time()
+            print(f"\n🔄 Epoch {epoch + 1}/{epochs}")
+
+            train_metrics = self._simulate_epoch(
                 phase="train",
                 epoch=epoch,
                 steps_per_epoch=steps_per_epoch,
                 global_step=global_step,
-                learning_rate=learning_rate
+                learning_rate=learning_rate,
             )
-            
             global_step += steps_per_epoch
-            
-            # Validation phase
+
             val_metrics = self._simulate_epoch(
-                phase="validation",
+                phase="val",
                 epoch=epoch,
-                steps_per_epoch=dataset_info['val_samples'] // batch_size,
-                global_step=global_step
+                steps_per_epoch=max(1, dataset_info['val_samples'] // batch_size),
+                global_step=global_step,
             )
-            
-            # Combine metrics
-            combined_metrics = {**epoch_metrics, **val_metrics}
-            combined_metrics['epoch'] = epoch
-            combined_metrics['learning_rate'] = learning_rate * (0.95 ** epoch)  # LR decay
-            
-            # Log epoch metrics
-            self.tracker.log_metrics(combined_metrics, step=global_step)
-            
-            # Resource monitoring
-            if self.gpu_monitor:
-                gpu_stats = self.gpu_monitor.get_gpu_stats()
-                if gpu_stats:
-                    self.tracker.log_resource_usage({
-                        'gpu_utilization': gpu_stats[0].get('utilization_percent', 0),
-                        'gpu_memory_used_mb': gpu_stats[0].get('memory_used_mb', 0),
-                        'gpu_temperature': gpu_stats[0].get('temperature', 0)
-                    })
-                    
-                    # Log to Prometheus
-                    if self.metrics_collector:
-                        self.metrics_collector.update_gpu_metrics(gpu_stats)
-            
-            # Log to Prometheus
-            if self.metrics_collector:
-                epoch_time = time.time() - epoch_start_time
-                self.metrics_collector.record_training_step(
+
+            epoch_time = time.time() - e_start
+            combined = {
+                **train_metrics, **val_metrics,
+                "epoch": epoch,
+                "learning_rate": learning_rate * (0.95 ** epoch),
+                "epoch_time_sec": epoch_time,
+            }
+
+            self.tracker.log_metrics(combined, step=global_step)
+
+            # GPU + system usage snapshot -> tracker + Prometheus
+            self._log_gpu_and_system_metrics()
+
+            if self.metrics:
+                # approximate step time + throughput
+                self.metrics.record_training_step(
                     experiment_id=self.tracker.run_id,
                     model_type=self.config['model']['architecture']['type'],
-                    step_time=epoch_time / steps_per_epoch,
-                    loss=epoch_metrics['train_loss'],
-                    samples_per_sec=batch_size * steps_per_epoch / epoch_time
+                    step_time=epoch_time / max(1, steps_per_epoch),
+                    loss=train_metrics['train_loss'],
+                    samples_per_sec=(batch_size * steps_per_epoch) / max(1e-6, epoch_time),
                 )
-                
-                self.metrics_collector.record_epoch_completion(
+                self.metrics.record_epoch_completion(
                     experiment_id=self.tracker.run_id,
                     model_type=self.config['model']['architecture']['type'],
-                    epoch_time=epoch_time
+                    epoch_time=epoch_time,
                 )
-            
-            # Model checkpointing
-            if epoch % training_config.get('checkpoint_every', 5) == 0:
-                self._save_checkpoint(epoch, combined_metrics)
-            
-            # Early stopping check
-            val_accuracy = val_metrics['val_accuracy']
-            if val_accuracy > best_val_accuracy:
-                best_val_accuracy = val_accuracy
-                no_improvement_count = 0
-                self._save_best_model(epoch, combined_metrics)
+
+            # checkpointing
+            if (epoch % tr_cfg.get('checkpoint_every', 5)) == 0:
+                self._save_checkpoint(epoch, combined)
+
+            # early stopping check
+            val_acc = val_metrics['val_accuracy']
+            if val_acc > best_val_acc + tr_cfg.get('early_stopping', {}).get('min_delta', 0.0):
+                best_val_acc = val_acc
+                no_improve = 0
+                self._save_best_model(epoch, combined)
             else:
-                no_improvement_count += 1
-            
-            # Print epoch summary
-            print(f"✅ Epoch {epoch + 1} completed in {time.time() - epoch_start_time:.1f}s")
-            print(f"   Train Loss: {epoch_metrics['train_loss']:.4f}, "
-                  f"Train Acc: {epoch_metrics['train_accuracy']:.4f}")
-            print(f"   Val Loss: {val_metrics['val_loss']:.4f}, "
-                  f"Val Acc: {val_metrics['val_accuracy']:.4f}")
-            
-            # Early stopping
-            early_stop_patience = training_config.get('early_stopping', {}).get('patience', 10)
-            if no_improvement_count >= early_stop_patience:
-                print(f"🛑 Early stopping triggered after {no_improvement_count} epochs without improvement")
+                no_improve += 1
+
+            # epoch summary
+            print(f"✅ Epoch {epoch + 1} in {epoch_time:.1f}s "
+                  f"| Train: loss={train_metrics['train_loss']:.4f}, acc={train_metrics['train_accuracy']:.4f} "
+                  f"| Val: loss={val_metrics['val_loss']:.4f}, acc={val_acc:.4f}")
+
+            # early stop
+            if no_improve >= tr_cfg.get('early_stopping', {}).get('patience', 10):
+                print(f"🛑 Early stopping after {no_improve} epochs w/o improvement")
                 break
-            
-            # Learning rate decay
-            if epoch > 0 and epoch % training_config.get('lr_decay_every', 10) == 0:
-                learning_rate *= training_config.get('lr_decay_factor', 0.8)
-                print(f"📉 Learning rate decayed to {learning_rate:.6f}")
-        
-        print(f"🎯 Training completed! Best validation accuracy: {best_val_accuracy:.4f}")
-        return best_val_accuracy
-    
-    def _simulate_epoch(self, phase: str, epoch: int, steps_per_epoch: int, 
-                       global_step: int, learning_rate: float = None) -> Dict[str, float]:
-        """Simulate a single epoch of training or validation"""
-        
-        is_training = phase == "train"
-        
-        # Simulate epoch with realistic loss curves
-        if is_training:
-            # Training loss decreases with some noise
+
+            # optional manual LR decay
+            if epoch > 0 and (epoch % tr_cfg.get('lr_decay_every', 9999) == 0):
+                learning_rate *= tr_cfg.get('lr_decay_factor', 1.0)
+                print(f"📉 LR decayed to {learning_rate:.6f}")
+
+        print(f"🎯 Training finished | Best val acc: {best_val_acc:.4f}")
+        return best_val_acc
+
+    def _simulate_epoch(self, phase: str, epoch: int, steps_per_epoch: int,
+                        global_step: int, learning_rate: Optional[float] = None) -> Dict[str, float]:
+        """Simulate metrics evolution with noise."""
+        is_train = (phase == "train")
+        if is_train:
             base_loss = 2.0 * np.exp(-epoch * 0.15) + 0.1
-            base_accuracy = min(0.98, 1.0 - np.exp(-epoch * 0.2))
+            base_acc = min(0.98, 1.0 - np.exp(-epoch * 0.2))
         else:
-            # Validation metrics are slightly worse and noisier
             base_loss = 2.2 * np.exp(-epoch * 0.12) + 0.15
-            base_accuracy = min(0.95, 0.95 - np.exp(-epoch * 0.18))
-        
-        # Add realistic noise
-        loss = base_loss + np.random.normal(0, 0.05)
-        accuracy = max(0.0, min(1.0, base_accuracy + np.random.normal(0, 0.02)))
-        
-        # Simulate step-by-step progress for training
-        if is_training and steps_per_epoch > 50:  # Only for longer epochs
-            for step in range(0, steps_per_epoch, max(1, steps_per_epoch // 10)):
-                step_loss = loss + np.random.normal(0, 0.02)
-                step_acc = accuracy + np.random.normal(0, 0.01)
-                
+            base_acc = min(0.95, 0.95 - np.exp(-epoch * 0.18))
+
+        loss = float(base_loss + np.random.normal(0, 0.05))
+        acc = float(np.clip(base_acc + np.random.normal(0, 0.02), 0.0, 1.0))
+
+        # lightweight per-step logging (10 checkpoints per epoch)
+        if is_train and steps_per_epoch > 50 and hasattr(self.tracker, "log_metrics"):
+            stride = max(1, steps_per_epoch // 10)
+            for step in range(0, steps_per_epoch, stride):
                 step_metrics = {
-                    f'{phase}_loss_step': step_loss,
-                    f'{phase}_accuracy_step': step_acc,
-                    'step': global_step + step
+                    f'{phase}_loss_step': float(loss + np.random.normal(0, 0.02)),
+                    f'{phase}_accuracy_step': float(np.clip(acc + np.random.normal(0, 0.01), 0.0, 1.0)),
+                    'step': global_step + step,
                 }
-                
-                if learning_rate:
-                    step_metrics['learning_rate'] = learning_rate
-                
+                if learning_rate is not None:
+                    step_metrics['learning_rate'] = float(learning_rate)
                 self.tracker.log_metrics(step_metrics, step=global_step + step)
-                
-                # Simulate step time
                 time.sleep(0.01)
-        
-        # Simulate epoch computation time
+
+        # simulate compute time for the epoch
         time.sleep(min(2.0, steps_per_epoch * 0.001))
-        
-        return {
-            f'{phase}_loss': loss,
-            f'{phase}_accuracy': accuracy,
-            f'{phase}_perplexity': np.exp(loss),
-            f'{phase}_f1_score': accuracy * 0.95 + np.random.normal(0, 0.01)
-        }
-    
+
+        # return epoch aggregates
+        if is_train:
+            return {
+                'train_loss': loss,
+                'train_accuracy': acc,
+                'train_perplexity': float(np.exp(loss)),
+                'train_f1_score': float(np.clip(acc * 0.95 + np.random.normal(0, 0.01), 0.0, 1.0)),
+            }
+        else:
+            return {
+                'val_loss': loss,
+                'val_accuracy': acc,
+                'val_perplexity': float(np.exp(loss)),
+                'val_f1_score': float(np.clip(acc * 0.95 + np.random.normal(0, 0.01), 0.0, 1.0)),
+            }
+
+    # ---------------------- GPU + system logging helper -------------------------
+    def _log_gpu_and_system_metrics(self):
+        if not self.gpu_monitor:
+            return
+
+        snapshot = self.gpu_monitor.get_current_usage()
+        gpu_list = snapshot.get('gpu_devices', []) or []
+
+        # log to tracker (first GPU summary)
+        if gpu_list and hasattr(self.tracker, "log_resource_usage"):
+            g0 = gpu_list[0]
+            self.tracker.log_resource_usage({
+                'gpu_utilization_percent': g0.get('utilization_percent', g0.get('utilization', 0)),
+                'gpu_memory_used_mb': g0.get('memory_used_mb', 0),
+                'gpu_temperature_c': g0.get('temperature_c', g0.get('temperature', 0)),
+            })
+
+        # normalize for Prometheus update_gpu_metrics API
+        if self.metrics and gpu_list:
+            prom_ready = []
+            for g in gpu_list:
+                mem_used_mb = g.get('memory_used_mb') or g.get('memory_allocated_mb')
+                mem_total_mb = g.get('memory_total_mb')
+                prom_ready.append({
+                    'id': g.get('device_id', g.get('id', 0)),
+                    'name': g.get('name', 'unknown'),
+                    'utilization': g.get('utilization_percent', g.get('utilization', 0)),
+                    'memory_used': (mem_used_mb or 0) * 1024 * 1024,
+                    'memory_total': (mem_total_mb or 0) * 1024 * 1024,
+                    'temperature': g.get('temperature_c', g.get('temperature', 0)),
+                    'power_draw': g.get('power_usage_w', g.get('power_draw_w', 0)),
+                })
+            self.metrics.update_gpu_metrics(prom_ready)
+
+    # ---------------------- Artifacts ------------------------------------------
     def _save_checkpoint(self, epoch: int, metrics: Dict[str, float]):
-        """Save model checkpoint"""
-        checkpoint_info = {
+        info = {
             'epoch': epoch,
             'model_state': f"checkpoint_epoch_{epoch}.pth",
             'optimizer_state': f"optimizer_epoch_{epoch}.pth",
             'metrics': metrics,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now().isoformat(),
         }
-        
-        # Create dummy checkpoint file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(checkpoint_info, f, indent=2)
-            checkpoint_file = f.name
-        
+            json.dump(info, f, indent=2)
+            tmp = f.name
         try:
-            self.tracker.log_artifact(checkpoint_file, f"checkpoints/checkpoint_epoch_{epoch}.json")
-            print(f"💾 Checkpoint saved for epoch {epoch}")
+            self.tracker.log_artifact(tmp, f"checkpoints/checkpoint_epoch_{epoch}.json")
+            print(f"💾 Checkpoint saved (epoch {epoch})")
         finally:
-            os.unlink(checkpoint_file)
-    
+            try: os.unlink(tmp)
+            except OSError: pass
+
     def _save_best_model(self, epoch: int, metrics: Dict[str, float]):
-        """Save best model"""
-        model_info = {
+        payload = {
             'epoch': epoch,
             'metrics': metrics,
             'model_architecture': self.config['model']['architecture'],
             'hyperparameters': self.config['model']['hyperparameters'],
             'timestamp': datetime.now().isoformat(),
-            'best_model': True
+            'best_model': True,
         }
-        
-        # Create dummy model file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(model_info, f, indent=2)
-            model_file = f.name
-        
+            json.dump(payload, f, indent=2)
+            tmp = f.name
         try:
-            self.tracker.log_artifact(model_file, "models/best_model.json")
-            
-            # Register model in MLflow Model Registry
-            model_name = f"{self.config['experiment']['name']}_model"
-            self.tracker.register_model(
-                model_name=model_name,
-                model_path="models/best_model.json",
-                description=f"Best model from epoch {epoch} with val_acc={metrics.get('val_accuracy', 0):.4f}"
-            )
-            
-            print(f"🏆 Best model saved and registered: {model_name}")
+            self.tracker.log_artifact(tmp, "models/best_model.json")
+            # optional: register to model registry if supported
+            if hasattr(self.tracker, "register_model"):
+                model_name = f"{self.config['experiment']['name']}_model"
+                self.tracker.register_model(
+                    model_name=model_name,
+                    model_path="models/best_model.json",
+                    description=f"Best model @ epoch {epoch} (val_acc={metrics.get('val_accuracy', 0):.4f})",
+                )
+                print(f"🏆 Best model saved & registered: {model_name}")
+            else:
+                print("🏆 Best model saved")
         finally:
-            os.unlink(model_file)
-    
-    def run_evaluation(self, best_accuracy: float):
-        """Run comprehensive model evaluation"""
+            try: os.unlink(tmp)
+            except OSError: pass
+
+    # ---------------------- Evaluation & report ---------------------------------
+    def run_evaluation(self, best_accuracy: float) -> Dict[str, float]:
         print("\n🧪 Running model evaluation...")
-        
-        # Simulate evaluation on test set
-        test_metrics = {
-            'test_accuracy': best_accuracy * 0.98 + np.random.normal(0, 0.01),
-            'test_loss': 0.15 + np.random.normal(0, 0.02),
-            'test_f1_score': best_accuracy * 0.96 + np.random.normal(0, 0.01),
-            'test_precision': best_accuracy * 0.97 + np.random.normal(0, 0.01),
-            'test_recall': best_accuracy * 0.95 + np.random.normal(0, 0.01)
+        test = {
+            'test_accuracy': float(np.clip(best_accuracy * 0.98 + np.random.normal(0, 0.01), 0.0, 1.0)),
+            'test_loss': float(0.15 + np.random.normal(0, 0.02)),
+            'test_f1_score': float(np.clip(best_accuracy * 0.96 + np.random.normal(0, 0.01), 0.0, 1.0)),
+            'test_precision': float(np.clip(best_accuracy * 0.97 + np.random.normal(0, 0.01), 0.0, 1.0)),
+            'test_recall': float(np.clip(best_accuracy * 0.95 + np.random.normal(0, 0.01), 0.0, 1.0)),
+            'bleu_score': float(np.clip(85 + np.random.normal(0, 5), 0, 100)),
+            'rouge_l': float(np.clip(0.8 + np.random.normal(0, 0.05), 0, 1.0)),
         }
-        
-        # Add domain-specific metrics
-        test_metrics.update({
-            'bleu_score': min(100, max(0, 85 + np.random.normal(0, 5))),
-            'rouge_l': min(1.0, max(0, 0.8 + np.random.normal(0, 0.05))),
-            'perplexity': np.exp(test_metrics['test_loss'])
-        })
-        
-        # Log test metrics
-        self.tracker.log_metrics(test_metrics)
-        
-        # Log to Prometheus
-        if self.metrics_collector:
-            self.metrics_collector.record_model_metrics(
+        test['perplexity'] = float(np.exp(test['test_loss']))
+
+        self.tracker.log_metrics(test)
+
+        if self.metrics:
+            self.metrics.record_model_metrics(
                 experiment_id=self.tracker.run_id,
                 model_type=self.config['model']['architecture']['type'],
-                accuracy=test_metrics['test_accuracy'],
-                precision=test_metrics['test_precision'],
-                recall=test_metrics['test_recall'],
-                f1_score=test_metrics['test_f1_score'],
-                dataset='test'
+                accuracy=test['test_accuracy'],
+                precision=test['test_precision'],
+                recall=test['test_recall'],
+                f1_score=test['test_f1_score'],
+                dataset='test',
             )
-        
+
         print("✅ Evaluation completed:")
-        for metric, value in test_metrics.items():
-            if isinstance(value, float):
-                print(f"   {metric}: {value:.4f}")
-            else:
-                print(f"   {metric}: {value}")
-        
-        return test_metrics
-    
-    def generate_final_report(self, test_metrics: Dict[str, float]):
-        """Generate comprehensive experiment report"""
+        for k, v in test.items():
+            print(f"   {k}: {v:.4f}" if isinstance(v, float) else f"   {k}: {v}")
+        return test
+
+    def generate_final_report(self, test_metrics: Dict[str, float]) -> Dict[str, Any]:
         print("\n📋 Generating final report...")
-        
-        # Collect all experiment data
-        run_data = self.tracker.get_run_data()
-        
+        run_data = {}
+        if hasattr(self.tracker, "get_run_data"):
+            run_data = self.tracker.get_run_data()
+
+        start_time = run_data.get('start_time', datetime.now().isoformat())
+        duration_min = (datetime.now() - datetime.fromisoformat(start_time)).total_seconds() / 60.0
+
+        best_val = 0.0
+        metrics_blob = run_data.get('metrics', {}) if isinstance(run_data.get('metrics', {}), dict) else {}
+        for k, v in metrics_blob.items():
+            if 'val_accuracy' in k:
+                try:
+                    best_val = max(best_val, float(v))
+                except Exception:
+                    pass
+
         report = {
             'experiment_summary': {
-                'name': self.tracker.experiment_name,
-                'run_id': self.tracker.run_id,
-                'start_time': run_data.get('start_time'),
+                'name': getattr(self.tracker, "experiment_name", "unknown"),
+                'run_id': getattr(self.tracker, "run_id", "unknown"),
+                'start_time': start_time,
                 'end_time': datetime.now().isoformat(),
-                'duration_minutes': (datetime.now() - datetime.fromisoformat(run_data.get('start_time', datetime.now().isoformat()))).total_seconds() / 60
+                'duration_minutes': duration_min,
             },
             'configuration': self.config,
             'final_metrics': test_metrics,
-            'best_validation_accuracy': max([m for k, m in run_data.get('metrics', {}).items() if 'val_accuracy' in k], default=0),
+            'best_validation_accuracy': best_val,
             'total_parameters': run_data.get('model_info', {}).get('total_parameters', 0),
             'artifacts': run_data.get('artifacts', []),
             'tags': run_data.get('tags', {}),
-            'environment': run_data.get('environment', {})
+            'environment': run_data.get('environment', {}),
         }
-        
-        # Save report as artifact
+
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             json.dump(report, f, indent=2)
-            report_file = f.name
-        
+            tmp = f.name
         try:
-            self.tracker.log_artifact(report_file, "reports/final_report.json")
+            self.tracker.log_artifact(tmp, "reports/final_report.json")
             print("✅ Final report saved")
         finally:
-            os.unlink(report_file)
-        
-        # Print summary
-        print("\n" + "="*60)
+            try: os.unlink(tmp)
+            except OSError: pass
+
+        print("\n" + "=" * 60)
         print("🎯 EXPERIMENT SUMMARY")
-        print("="*60)
+        print("=" * 60)
         print(f"Experiment: {report['experiment_summary']['name']}")
         print(f"Run ID: {report['experiment_summary']['run_id']}")
         print(f"Duration: {report['experiment_summary']['duration_minutes']:.1f} minutes")
         print(f"Best Val Accuracy: {report['best_validation_accuracy']:.4f}")
         print(f"Test Accuracy: {test_metrics['test_accuracy']:.4f}")
         print(f"Model Parameters: {report['total_parameters']:,}")
-        print(f"Artifacts: {len(report['artifacts'])} files")
-        print("="*60)
-        
+        print(f"Artifacts: {len(report['artifacts'])}")
+        print("=" * 60)
         return report
-    
+
+    # ---------------------- Cleanup --------------------------------------------
     def cleanup(self):
-        """Clean up resources"""
         print("\n🧹 Cleaning up...")
-        
         try:
-            # Finish the MLflow run
-            self.tracker.finish_run(status="FINISHED")
-            
-            # Record experiment completion in Prometheus
-            if self.metrics_collector:
-                self.metrics_collector.record_experiment_completion(
+            if self.tracker:
+                self.tracker.finish_run(status="FINISHED")
+            if self.metrics:
+                # optional: mark experiment completion
+                self.metrics.record_experiment_completion(
                     model_type=self.config['model']['architecture']['type'],
-                    success=True
+                    success=True,
                 )
-            
             print("✅ Experiment finished successfully")
-            
         except Exception as e:
             print(f"⚠️  Cleanup error: {e}")
             if self.tracker:
                 self.tracker.finish_run(status="FAILED")
 
+
+# ---------------------- Config loading ----------------------------------------
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
-    """Load experiment configuration"""
-    
-    default_config = {
+    default = {
         'experiment': {
             'name': 'lezea_full_training_demo',
             'description': 'Complete LeZeA MLOps training demonstration with all features',
-            'tags': {
-                'team': 'ml-research',
-                'priority': 'high',
-                'framework': 'pytorch',
-                'model_family': 'transformer'
-            }
+            'tags': {'team': 'ml-research', 'priority': 'high', 'framework': 'pytorch', 'model_family': 'transformer'},
         },
         'model': {
             'architecture': {
-                'type': 'transformer',
-                'num_layers': 12,
-                'hidden_size': 768,
-                'num_heads': 12,
-                'vocab_size': 50000,
-                'max_sequence_length': 512,
-                'dropout_rate': 0.1
+                'type': 'transformer', 'num_layers': 12, 'hidden_size': 768,
+                'num_heads': 12, 'vocab_size': 50000, 'max_sequence_length': 512, 'dropout_rate': 0.1,
             },
             'hyperparameters': {
-                'learning_rate': 0.0001,
-                'batch_size': 32,
-                'weight_decay': 0.01,
-                'beta1': 0.9,
-                'beta2': 0.999,
-                'epsilon': 1e-8,
-                'max_grad_norm': 1.0,
-                'warmup_steps': 1000
-            }
+                'learning_rate': 1e-4, 'batch_size': 32, 'weight_decay': 0.01,
+                'beta1': 0.9, 'beta2': 0.999, 'epsilon': 1e-8, 'max_grad_norm': 1.0, 'warmup_steps': 1000,
+            },
         },
         'data': {
-            'dataset_name': 'lezea_training_data',
-            'version': '1.2.0',
-            'train_samples': 100000,
-            'val_samples': 10000,
-            'test_samples': 5000,
-            'features': 768,
-            'size_gb': 2.5,
-            'preprocessing': ['tokenization', 'normalization', 'augmentation']
+            'dataset_name': 'lezea_training_data', 'version': '1.2.0',
+            'train_samples': 100_000, 'val_samples': 10_000, 'test_samples': 5_000,
+            'features': 768, 'size_gb': 2.5, 'preprocessing': ['tokenization', 'normalization', 'augmentation'],
         },
         'training': {
-            'epochs': 20,
-            'optimizer': 'adamw',
-            'scheduler': {
-                'type': 'cosine',
-                'warmup_epochs': 2,
-                'min_lr': 1e-6
-            },
-            'regularization': {
-                'dropout': 0.1,
-                'weight_decay': 0.01,
-                'label_smoothing': 0.1
-            },
-            'early_stopping': {
-                'patience': 5,
-                'min_delta': 0.001
-            },
-            'checkpoint_every': 3,
-            'lr_decay_every': 8,
-            'lr_decay_factor': 0.8
-        }
+            'epochs': 20, 'optimizer': 'adamw',
+            'scheduler': {'type': 'cosine', 'warmup_epochs': 2, 'min_lr': 1e-6},
+            'regularization': {'dropout': 0.1, 'weight_decay': 0.01, 'label_smoothing': 0.1},
+            'early_stopping': {'patience': 5, 'min_delta': 0.001},
+            'checkpoint_every': 3, 'lr_decay_every': 8, 'lr_decay_factor': 0.8,
+        },
     }
-    
+
     if config_path and os.path.exists(config_path):
         print(f"📂 Loading config from {config_path}")
-        with open(config_path) as f:
-            if config_path.endswith('.yaml') or config_path.endswith('.yml'):
-                custom_config = yaml.safe_load(f)
-            else:
-                custom_config = json.load(f)
-        
-        # Merge configurations (custom overrides default)
-        def merge_configs(default, custom):
-            for key, value in custom.items():
-                if key in default and isinstance(default[key], dict) and isinstance(value, dict):
-                    merge_configs(default[key], value)
-                else:
-                    default[key] = value
-        
-        merge_configs(default_config, custom_config)
-    
-    return default_config
+        with open(config_path, 'r') as f:
+            custom = yaml.safe_load(f) if config_path.endswith(('.yaml', '.yml')) else json.load(f)
 
+        def merge(a: Dict[str, Any], b: Dict[str, Any]):
+            for k, v in b.items():
+                if isinstance(v, dict) and isinstance(a.get(k), dict):
+                    merge(a[k], v)
+                else:
+                    a[k] = v
+
+        merge(default, custom)
+    return default
+
+
+# ---------------------- Entrypoint --------------------------------------------
 def main():
-    """Main function"""
     parser = argparse.ArgumentParser(description='LeZeA MLOps Complete Training Example')
     parser.add_argument('--config', type=str, help='Path to configuration file (YAML or JSON)')
     parser.add_argument('--experiment-name', type=str, help='Override experiment name')
     parser.add_argument('--epochs', type=int, help='Override number of epochs')
     parser.add_argument('--batch-size', type=int, help='Override batch size')
     parser.add_argument('--learning-rate', type=float, help='Override learning rate')
-    
     args = parser.parse_args()
-    
-    # Load configuration
+
     config = load_config(args.config)
-    
-    # Apply command-line overrides
-    if args.experiment_name:
-        config['experiment']['name'] = args.experiment_name
-    if args.epochs:
-        config['training']['epochs'] = args.epochs
-    if args.batch_size:
-        config['model']['hyperparameters']['batch_size'] = args.batch_size
-    if args.learning_rate:
-        config['model']['hyperparameters']['learning_rate'] = args.learning_rate
-    
+    if args.experiment_name: config['experiment']['name'] = args.experiment_name
+    if args.epochs:          config['training']['epochs'] = args.epochs
+    if args.batch_size:      config['model']['hyperparameters']['batch_size'] = args.batch_size
+    if args.learning_rate:   config['model']['hyperparameters']['learning_rate'] = args.learning_rate
+
     print("🚀 LeZeA MLOps - Complete Training Example")
-    print("="*60)
+    print("=" * 60)
     print(f"Experiment: {config['experiment']['name']}")
     print(f"Model: {config['model']['architecture']['type']}")
     print(f"Epochs: {config['training']['epochs']}")
     print(f"Batch Size: {config['model']['hyperparameters']['batch_size']}")
-    print("="*60)
-    
-    # Initialize and run training
+    print("=" * 60)
+
     trainer = LeZeATrainingExample(config)
-    
     try:
-        # Setup
         trainer.setup_experiment()
         trainer.log_configuration()
-        
-        # Data preparation
         dataset_info = trainer.simulate_data_loading()
-        
-        # Model initialization
         model_info = trainer.simulate_model_initialization()
-        
-        # Training loop
-        best_accuracy = trainer.simulate_training_loop(dataset_info, model_info)
-        
-        # Evaluation
-        test_metrics = trainer.run_evaluation(best_accuracy)
-        
-        # Final report
-        report = trainer.generate_final_report(test_metrics)
-        
-        print(f"\n🎉 Training completed successfully!")
-        print(f"🌐 View results: http://localhost:5000")
-        print(f"📊 Prometheus metrics: http://localhost:9090")
-        print(f"📈 Grafana dashboards: http://localhost:3000")
-        
+        best_acc = trainer.simulate_training_loop(dataset_info, model_info)
+        test_metrics = trainer.run_evaluation(best_acc)
+        trainer.generate_final_report(test_metrics)
+        print("\n🎉 Training completed successfully!")
+        print("🌐 MLflow:     http://localhost:5000")
+        print("📊 Prometheus: http://localhost:9090")
+        print("📈 Grafana:    http://localhost:3000")
     except Exception as e:
         print(f"❌ Training failed: {e}")
         if trainer.tracker:
             trainer.tracker.finish_run(status="FAILED")
         raise
-    
     finally:
-        # Always cleanup
         trainer.cleanup()
 
-if __name__ == "__main__":
-    main()#!/usr/bin/env python3
-"""
-LeZeA MLOps - Complete Training Example
-======================================
-
-Comprehensive example showing all LeZeA MLOps features:
-- Advanced experiment configuration
-- Comprehensive logging and monitoring
-- Resource tracking and optimization
-- Model versioning and deployment
-- Integration with all backends
-
-This is the complete example Marcus can use as a template for production training.
-
-Usage:
-    python examples/full_training.py [--config config.yaml] [--experiment-name NAME]
-"""
-
-import os
-import sys
-import json
-import time
-import yaml
-import argparse
-import tempfile
-import numpy as np
-from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Any, Optional
-
-# Add project root to path
-PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
-
-from lezea_mlops import ExperimentTracker
-from lezea_mlops.monitoring import get_metrics, GPUMonitor, EnvironmentTagger
-
-class LeZeATrainingExample:
-    """Complete LeZeA training example with all features"""
-    
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.tracker = None
-        self.metrics_collector = None
-        self.gpu_monitor = None
-        
-    def setup_experiment(self):
-        """Initialize experiment tracking and monitoring"""
-        print("🔧 Setting up experiment...")
-        
-        # Initialize experiment tracker with advanced configuration
-        self.tracker = ExperimentTracker(
-            experiment_name=self.config['experiment']['name'],
-            description=self.config['experiment']['description'],
-            tags=self.config['experiment'].get('tags', {}),
-            create_if_not_exists=True
-        )
-        
-        # Initialize metrics collection
-        self.metrics_collector = get_metrics()
-        
-        # Initialize GPU monitoring if available
-        try:
-            self.gpu_monitor = GPUMonitor()
-            print("✅ GPU monitoring initialized")
-        except Exception as e:
-            print(f"⚠️  GPU monitoring unavailable: {e}")
-            self.gpu_monitor = None
-        
-        # Log environment information
-        env_tagger = EnvironmentTagger()
-        env_info = env_tagger.get_complete_environment()
-        self.tracker.log_environment_info(env_info)
-        
-        print(f"✅ Experiment '{self.tracker.experiment_name}' initialized")
-        print(f"📊 Run ID: {self.tracker.run_id}")
-        print(f"🌐 MLflow UI: http://localhost:5000")
-        
-    def log_configuration(self):
-        """Log complete experiment configuration"""
-        print("📝 Logging experiment configuration...")
-        
-        # Log hyperparameters
-        self.tracker.log_params(self.config['model']['hyperparameters'])
-        
-        # Log model architecture
-        self.tracker.log_model_architecture(self.config['model']['architecture'])
-        
-        # Log dataset information
-        self.tracker.log_dataset_info(self.config['data'])
-        
-        # Log training configuration
-        training_config = {
-            'optimizer': self.config['training']['optimizer'],
-            'scheduler': self.config['training'].get('scheduler', {}),
-            'regularization': self.config['training'].get('regularization', {}),
-            'early_stopping': self.config['training'].get('early_stopping', {})
-        }
-        self.tracker.log_params(training_config)
-        
-        print("✅ Configuration logged")
-    
-    def simulate_data_loading(self) -> Dict[str, Any]:
-        """Simulate data loading with monitoring"""
-        print("📊 Loading and preparing data...")
-        
-        data_config = self.config['data']
-        
-        # Simulate data loading time
-        load_time = np.random.uniform(2.0, 5.0)
-        time.sleep(load_time)
-        
-        # Create simulated dataset metadata
-        dataset_info = {
-            'name': data_config['dataset_name'],
-            'version': data_config['version'],
-            'train_samples': data_config['train_samples'],
-            'val_samples': data_config['val_samples'],
-            'test_samples': data_config['test_samples'],
-            'features': data_config['features'],
-            'preprocessing': data_config['preprocessing'],
-            'load_time_seconds': load_time
-        }
-        
-        # Log dataset metrics
-        self.tracker.log_dataset_metrics({
-            'dataset_size_gb': data_config['size_gb'],
-            'data_quality_score': 0.95,
-            'missing_values_percent': 0.02,
-            'data_loading_time': load_time
-        })
-        
-        # Register dataset version with DVC
-        try:
-            self.tracker.dvc_backend.track_dataset(
-                dataset_name=data_config['dataset_name'],
-                version=data_config['version'],
-                file_path=f"data/{data_config['dataset_name']}.parquet",
-                metadata=dataset_info
-            )
-            print("✅ Dataset version tracked with DVC")
-        except Exception as e:
-            print(f"⚠️  DVC tracking failed: {e}")
-        
-        print(f"✅ Data loaded: {dataset_info['train_samples']:,} train, "
-              f"{dataset_info['val_samples']:,} validation, "
-              f"{dataset_info['test_samples']:,} test samples")
-        
-        return dataset_info
-    
-    def simulate_model_initialization(self) -> Dict[str, Any]:
-        """Simulate model initialization with architecture logging"""
-        print("🧠 Initializing model...")
-        
-        model_config = self.config['model']
-        
-        # Simulate model creation time
-        init_time = np.random.uniform(1.0, 3.0)
-        time.sleep(init_time)
-        
-        # Calculate model parameters
-        architecture = model_config['architecture']
-        total_params = (
-            architecture['hidden_size'] * architecture['vocab_size'] +  # Embedding
-            architecture['num_layers'] * architecture['hidden_size'] * architecture['hidden_size'] * 4 +  # Transformer layers
-            architecture['hidden_size'] * architecture['vocab_size']  # Output layer
-        )
-        
-        model_info = {
-            'total_parameters': total_params,
-            'trainable_parameters': int(total_params * 0.95),  # Some frozen params
-            'model_size_mb': total_params * 4 / (1024 * 1024),  # Assuming float32
-            'initialization_time': init_time,
-            'architecture_type': architecture['type']
-        }
-        
-        # Log model information
-        self.tracker.log_model_info(model_info)
-        
-        # Log to Prometheus if available
-        if self.metrics_collector:
-            self.metrics_collector.record_model_metrics(
-                experiment_id=self.tracker.run_id,
-                model_type=architecture['type']
-            )
-        
-        print(f"✅ Model initialized: {total_params:,} parameters ({model_info['model_size_mb']:.1f} MB)")
-        
-        return model_info
-    
-    def simulate_training_loop(self, dataset_info: Dict[str, Any], model_info: Dict[str, Any]):
-        """Simulate complete training loop with comprehensive monitoring"""
-        print("🚀 Starting training loop...")
-        
-        training_config = self.config['training']
-        num_epochs = training_config['epochs']
-        batch_size = self.config['model']['hyperparameters']['batch_size']
-        learning_rate = self.config['model']['hyperparameters']['learning_rate']
-        
-        # Calculate steps per epoch
-        steps_per_epoch = dataset_info['train_samples'] // batch_size
-        total_steps = num_epochs * steps_per_epoch
-        
-        print(f"📈 Training for {num_epochs} epochs, {steps_per_epoch} steps/epoch, {total_steps} total steps")
-        
-        # Training state
-        best_val_accuracy = 0.0
-        no_improvement_count = 0
-        global_step = 0
-        
-        for epoch in range(num_epochs):
-            epoch_start_time = time.time()
-            print(f"\n🔄 Epoch {epoch + 1}/{num_epochs}")
-            
-            # Training phase
-            epoch_metrics = self._simulate_epoch(
-                phase="train",
-                epoch=epoch,
-                steps_per_epoch=steps_per_epoch,
-                global_step=global_step,
-                learning_rate=learning_rate
-            )
-            
-            global_step += steps_per_epoch
-            
-            # Validation phase
-            val_metrics = self._simulate_epoch(
-                phase="validation",
-                epoch=epoch,
-                steps_per_epoch=dataset_info['val_samples'] // batch_size,
-                global_step=global_step
-            )
-            
-            # Combine metrics
-            combined_metrics = {**epoch_metrics, **val_metrics}
-            combined_metrics['epoch'] = epoch
-            combined_metrics['learning_rate'] = learning_rate * (0.95 ** epoch)  # LR decay
-            
-            # Log epoch metrics
-            self.tracker.log_metrics(combined_metrics, step=global_step)
-            
-            # Resource monitoring
-            if self.gpu_monitor:
-                gpu_stats = self.gpu_monitor.get_gpu_stats()
-                if gpu_stats:
-                    self.tracker.log_resource_usage({
-                        'gpu_utilization': gpu_stats[0].get('utilization_percent', 0),
-                        'gpu_memory_used_mb': gpu_stats[0].get('memory_used_mb', 0),
-                        'gpu_temperature': gpu_stats[0].get('temperature', 0)
-                    })
-                    
-                    # Log to Prometheus
-                    if self.metrics_collector:
-                        self.metrics_collector.update_gpu_metrics(gpu_stats)
-            
-            # Log to Prometheus
-            if self.metrics_collector:
-                epoch_time = time.time() - epoch_start_time
-                self.metrics_collector.record_training_step(
-                    experiment_id=self.tracker.run_id,
-                    model_type=self.config['model']['architecture']['type'],
-                    step_time=epoch_time / steps_per_epoch,
-                    loss=epoch_metrics['train_loss'],
-                    samples_per_sec=batch_size * steps_per_epoch / epoch_time
-                )
-                
-                self.metrics_collector.record_epoch_completion(
-                    experiment_id=self.tracker.run_id,
-                    model_type=self.config['model']['architecture']['type'],
-                    epoch_time=epoch_time
-                )
-            
-            # Model checkpointing
-            if epoch % training_config.get('checkpoint_every', 5) == 0:
-                self._save_checkpoint(epoch, combined_metrics)
-            
-            # Early stopping check
-            val_accuracy = val_metrics['val_accuracy']
-            if val_accuracy > best_val_accuracy:
-                best_val_accuracy = val_accuracy
-                no_improvement_count = 0
-                self._save_best_model(epoch, combined_metrics)
-            else:
-                no_improvement_count += 1
-            
-            # Print epoch summary
-            print(f"✅ Epoch {epoch + 1} completed in {time.time() - epoch_start_time:.1f}s")
-            print(f"   Train Loss: {epoch_metrics['train_loss']:.4f}, "
-                  f"Train Acc: {epoch_metrics['train_accuracy']:.4f}")
-            print(f"   Val Loss: {val_metrics['val_loss']:.4f}, "
-                  f"Val Acc: {val_metrics['val_accuracy']:.4f}")
-            
-            # Early stopping
-            early_stop_patience = training_config.get('early_stopping', {}).get('patience', 10)
-            if no_improvement_count >= early_stop_patience:
-                print(f"🛑 Early stopping triggered after {no_improvement_count} epochs without improvement")
-                break
-            
-            # Learning rate decay
-            if epoch > 0 and epoch % training_config.get('lr_decay_every', 10) == 0:
-                learning_rate *= training_config.get('lr_decay_factor', 0.8)
-                print(f"📉 Learning rate decayed to {learning_rate:.6f}")
-        
-        print(f"🎯 Training completed! Best validation accuracy: {best_val_accuracy:.4f}")
-        return best_val_accuracy
-    
-    def _simulate_epoch(self, phase: str, epoch: int, steps_per_epoch: int, 
-                       global_step: int, learning_rate: float = None) -> Dict[str, float]:
-        """Simulate a single epoch of training or validation"""
-        
-        is_training = phase == "train"
-        
-        # Simulate epoch with realistic loss curves
-        if is_training:
-            # Training loss decreases with some noise
-            base_loss = 2.0 * np.exp(-epoch * 0.15) + 0.1
-            base_accuracy = min(0.98, 1.0 - np.exp(-epoch * 0.2))
-        else:
-            # Validation metrics are slightly worse and noisier
-            base_loss = 2.2 * np.exp(-epoch * 0.12) + 0.15
-            base_accuracy = min(0.95, 0.95 - np.exp(-epoch * 0.18))
-        
-        # Add realistic noise
-        loss = base_loss + np.random.normal(0, 0.05)
-        accuracy = max(0.0, min(1.0, base_accuracy + np.random.normal(0, 0.02)))
-        
-        # Simulate step-by-step progress for training
-        if is_training and steps_per_epoch > 50:  # Only for longer epochs
-            for step in range(0, steps_per_epoch, max(1, steps_per_epoch // 10)):
-                step_loss = loss + np.random.normal(0, 0.02)
-                step_acc = accuracy + np.random.normal(0, 0.01)
-                
-                step_metrics = {
-                    f'{phase}_loss_step': step_loss,
-                    f'{phase}_accuracy_step': step_acc,
-                    'step': global_step + step
-                }
-                
-                if learning_rate:
-                    step_metrics['learning_rate'] = learning_rate
-                
-                self.tracker.log_metrics(step_metrics, step=global_step + step)
-                
-                # Simulate step time
-                time.sleep(0.01)
-        
-        # Simulate epoch computation time
-        time.sleep(min(2.0, steps_per_epoch * 0.001))
-        
-        return {
-            f'{phase}_loss': loss,
-            f'{phase}_accuracy': accuracy,
-            f'{phase}_perplexity': np.exp(loss),
-            f'{phase}_f1_score': accuracy * 0.95 + np.random.normal(0, 0.01)
-        }
-    
-    def _save_checkpoint(self, epoch: int, metrics: Dict[str, float]):
-        """Save model checkpoint"""
-        checkpoint_info = {
-            'epoch': epoch,
-            'model_state': f"checkpoint_epoch_{epoch}.pth",
-            'optimizer_state': f"optimizer_epoch_{epoch}.pth",
-            'metrics': metrics,
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        # Create dummy checkpoint file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(checkpoint_info, f, indent=2)
-            checkpoint_file = f.name
-        
-        try:
-            self.tracker.log_artifact(checkpoint_file, f"checkpoints/checkpoint_epoch_{epoch}.json")
-            print(f"💾 Checkpoint saved for epoch {epoch}")
-        finally:
-            os.unlink(checkpoint_file)
-    
-    def _save_best_model(self, epoch: int, metrics: Dict[str, float]):
-        """Save best model"""
-        model_info = {
-            'epoch': epoch,
-            'metrics': metrics,
-            'model_architecture': self.config['model']['architecture'],
-            'hyperparameters': self.config['model']['hyperparameters'],
-            'timestamp': datetime.now().isoformat(),
-            'best_model': True
-        }
-        
-        # Create dummy model file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(model_info, f, indent=2)
-            model_file = f.name
-        
-        try:
-            self.tracker.log_artifact(model_file, "models/best_model.json")
-            
-            # Register model in MLflow Model Registry
-            model_name = f"{self.config['experiment']['name']}_model"
-            self.tracker.register_model(
-                model_name=model_name,
-                model_path="models/best_model.json",
-                description=f"Best model from epoch {epoch} with val_acc={metrics.get('val_accuracy', 0):.4f}"
-            )
-            
-            print(f"🏆 Best model saved and registered: {model_name}")
-        finally:
-            os.unlink(model_file)
-    
-    def run_evaluation(self, best_accuracy: float):
-        """Run comprehensive model evaluation"""
-        print("\n🧪 Running model evaluation...")
-        
-        # Simulate evaluation on test set
-        test_metrics = {
-            'test_accuracy': best_accuracy * 0.98 + np.random.normal(0, 0.01),
-            'test_loss': 0.15 + np.random.normal(0, 0.02),
-            'test_f1_score': best_accuracy * 0.96 + np.random.normal(0, 0.01),
-            'test_precision': best_accuracy * 0.97 + np.random.normal(0, 0.01),
-            'test_recall': best_accuracy * 0.95 + np.random.normal(0, 0.01)
-        }
-        
-        # Add domain-specific metrics
-        test_metrics.update({
-            'bleu_score': min(100, max(0, 85 + np.random.normal(0, 5))),
-            'rouge_l': min(1.0, max(0, 0.8 + np.random.normal(0, 0.05))),
-            'perplexity': np.exp(test_metrics['test_loss'])
-        })
-        
-        # Log test metrics
-        self.tracker.log_metrics(test_metrics)
-        
-        # Log to Prometheus
-        if self.metrics_collector:
-            self.metrics_collector.record_model_metrics(
-                experiment_id=self.tracker.run_id,
-                model_type=self.config['model']['architecture']['type'],
-                accuracy=test_metrics['test_accuracy'],
-                precision=test_metrics['test_precision'],
-                recall=test_metrics['test_recall'],
-                f1_score=test_metrics['test_f1_score'],
-                dataset='test'
-            )
-        
-        print("✅ Evaluation completed:")
-        for metric, value in test_metrics.items():
-            if isinstance(value, float):
-                print(f"   {metric}: {value:.4f}")
-            else:
-                print(f"   {metric}: {value}")
-        
-        return test_metrics
-    
-    def generate_final_report(self, test_metrics: Dict[str, float]):
-        """Generate comprehensive experiment report"""
-        print("\n📋 Generating final report...")
-        
-        # Collect all experiment data
-        run_data = self.tracker.get_run_data()
-        
-        report = {
-            'experiment_summary': {
-                'name': self.tracker.experiment_name,
-                'run_id': self.tracker.run_id,
-                'start_time': run_data.get('start_time'),
-                'end_time': datetime.now().isoformat(),
-                'duration_minutes': (datetime.now() - datetime.fromisoformat(run_data.get('start_time', datetime.now().isoformat()))).total_seconds() / 60
-            },
-            'configuration': self.config,
-            'final_metrics': test_metrics,
-            'best_validation_accuracy': max([m for k, m in run_data.get('metrics', {}).items() if 'val_accuracy' in k], default=0),
-            'total_parameters': run_data.get('model_info', {}).get('total_parameters', 0),
-            'artifacts': run_data.get('artifacts', []),
-            'tags': run_data.get('tags', {}),
-            'environment': run_data.get('environment', {})
-        }
-        
-        # Save report as artifact
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(report, f, indent=2)
-            report_file = f.name
-        
-        try:
-            self.tracker.log_artifact(report_file, "reports/final_report.json")
-            print("✅ Final report saved")
-        finally:
-            os.unlink(report_file)
-        
-        # Print summary
-        print("\n" + "="*60)
-        print("🎯 EXPERIMENT SUMMARY")
-        print("="*60)
-        print(f"Experiment: {report['experiment_summary']['name']}")
-        print(f"Run ID: {report['experiment_summary']['run_id']}")
-        print(f"Duration: {report['experiment_summary']['duration_minutes']:.1f} minutes")
-        print(f"Best Val Accuracy: {report['best_validation_accuracy']:.4f}")
-        print(f"Test Accuracy: {test_metrics['test_accuracy']:.4f}")
-        print(f"Model Parameters: {report['total_parameters']:,}")
-        print(f"Artifacts: {len(report['artifacts'])} files")
-        print("="*60)
-        
-        return report
-    
-    def cleanup(self):
-        """Clean up resources"""
-        print("\n🧹 Cleaning up...")
-        
-        try:
-            # Finish the MLflow run
-            self.tracker.finish_run(status="FINISHED")
-            
-            # Record experiment completion in Prometheus
-            if self.metrics_collector:
-                self.metrics_collector.record_experiment_completion(
-                    model_type=self.config['model']['architecture']['type'],
-                    success=True
-                )
-            
-            print("✅ Experiment finished successfully")
-            
-        except Exception as e:
-            print(f"⚠️  Cleanup error: {e}")
-            if self.tracker:
-                self.tracker.finish_run(status="FAILED")
-
-def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
-    """Load experiment configuration"""
-    
-    default_config = {
-        'experiment': {
-            'name': 'lezea_full_training_demo',
-            'description': 'Complete LeZeA MLOps training demonstration with all features',
-            'tags': {
-                'team': 'ml-research',
-                'priority': 'high',
-                'framework': 'pytorch',
-                'model_family': 'transformer'
-            }
-        },
-        'model': {
-            'architecture': {
-                'type': 'transformer',
-                'num_layers': 12,
-                'hidden_size': 768,
-                'num_heads': 12,
-                'vocab_size': 50000,
-                'max_sequence_length': 512,
-                'dropout_rate': 0.1
-            },
-            'hyperparameters': {
-                'learning_rate': 0.0001,
-                'batch_size': 32,
-                'weight_decay': 0.01,
-                'beta1': 0.9,
-                'beta2': 0.999,
-                'epsilon': 1e-8,
-                'max_grad_norm': 1.0,
-                'warmup_steps': 1000
-            }
-        },
-        'data': {
-            'dataset_name': 'lezea_training_data',
-            'version': '1.2.0',
-            'train_samples': 100000,
-            'val_samples': 10000,
-            'test_samples': 5000,
-            'features': 768,
-            'size_gb': 2.5,
-            'preprocessing': ['tokenization', 'normalization', 'augmentation']
-        },
-        'training': {
-            'epochs': 20,
-            'optimizer': 'adamw',
-            'scheduler': {
-                'type': 'cosine',
-                'warmup_epochs': 2,
-                'min_lr': 1e-6
-            },
-            'regularization': {
-                'dropout': 0.1,
-                'weight_decay': 0.01,
-                'label_smoothing': 0.1
-            },
-            'early_stopping': {
-                'patience': 5,
-                'min_delta': 0.001
-            },
-            'checkpoint_every': 3,
-            'lr_decay_every': 8,
-            'lr_decay_factor': 0.8
-        }
-    }
-    
-    if config_path and os.path.exists(config_path):
-        print(f"📂 Loading config from {config_path}")
-        with open(config_path) as f:
-            if config_path.endswith('.yaml') or config_path.endswith('.yml'):
-                custom_config = yaml.safe_load(f)
-            else:
-                custom_config = json.load(f)
-        
-        # Merge configurations (custom overrides default)
-        def merge_configs(default, custom):
-            for key, value in custom.items():
-                if key in default and isinstance(default[key], dict) and isinstance(value, dict):
-                    merge_configs(default[key], value)
-                else:
-                    default[key] = value
-        
-        merge_configs(default_config, custom_config)
-    
-    return default_config
-
-def main():
-    """Main function"""
-    parser = argparse.ArgumentParser(description='LeZeA MLOps Complete Training Example')
-    parser.add_argument('--config', type=str, help='Path to configuration file (YAML or JSON)')
-    parser.add_argument('--experiment-name', type=str, help='Override experiment name')
-    parser.add_argument('--epochs', type=int, help='Override number of epochs')
-    parser.add_argument('--batch-size', type=int, help='Override batch size')
-    parser.add_argument('--learning-rate', type=float, help='Override learning rate')
-    
-    args = parser.parse_args()
-    
-    # Load configuration
-    config = load_config(args.config)
-    
-    # Apply command-line overrides
-    if args.experiment_name:
-        config['experiment']['name'] = args.experiment_name
-    if args.epochs:
-        config['training']['epochs'] = args.epochs
-    if args.batch_size:
-        config['model']['hyperparameters']['batch_size'] = args.batch_size
-    if args.learning_rate:
-        config['model']['hyperparameters']['learning_rate'] = args.learning_rate
-    
-    print("🚀 LeZeA MLOps - Complete Training Example")
-    print("="*60)
-    print(f"Experiment: {config['experiment']['name']}")
-    print(f"Model: {config['model']['architecture']['type']}")
-    print(f"Epochs: {config['training']['epochs']}")
-    print(f"Batch Size: {config['model']['hyperparameters']['batch_size']}")
-    print("="*60)
-    
-    # Initialize and run training
-    trainer = LeZeATrainingExample(config)
-    
-    try:
-        # Setup
-        trainer.setup_experiment()
-        trainer.log_configuration()
-        
-        # Data preparation
-        dataset_info = trainer.simulate_data_loading()
-        
-        # Model initialization
-        model_info = trainer.simulate_model_initialization()
-        
-        # Training loop
-        best_accuracy = trainer.simulate_training_loop(dataset_info, model_info)
-        
-        # Evaluation
-        test_metrics = trainer.run_evaluation(best_accuracy)
-        
-        # Final report
-        report = trainer.generate_final_report(test_metrics)
-        
-        print(f"\n🎉 Training completed successfully!")
-        print(f"🌐 View results: http://localhost:5000")
-        print(f"📊 Prometheus metrics: http://localhost:9090")
-        print(f"📈 Grafana dashboards: http://localhost:3000")
-        
-    except Exception as e:
-        print(f"❌ Training failed: {e}")
-        if trainer.tracker:
-            trainer.tracker.finish_run(status="FAILED")
-        raise
-    
-    finally:
-        # Always cleanup
-        trainer.cleanup()
 
 if __name__ == "__main__":
-    main()#!/usr/bin/env python3
+    main()

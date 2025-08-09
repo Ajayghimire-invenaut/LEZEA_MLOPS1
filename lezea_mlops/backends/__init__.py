@@ -25,4 +25,3 @@ __all__ = [
    'PostgresBackend',
    'DVCBackend'
 ]
-EOF

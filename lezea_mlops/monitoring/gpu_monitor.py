@@ -1,17 +1,26 @@
 """
-GPU Monitor for LeZeA MLOps
-==========================
+GPU Monitor for LeZeA MLOps — FINAL
+===================================
 
-Comprehensive GPU monitoring and resource tracking:
-- Real-time GPU utilization and memory usage
-- Multi-GPU system support
-- Temperature and power monitoring
-- Performance bottleneck detection
-- Automatic optimization recommendations
-- Integration with Prometheus metrics
+- Real-time GPU + system metrics (multi-GPU)
+- Auto-fallback: GPUtil → NVML → torch (any/none ok)
+- Thread-safe background sampler with ring buffers
+- Bottleneck detection + lightweight recommendations
+- Optional Prometheus exporter (if prometheus_client installed)
+- Tracker-friendly snapshot keys:
+  top-level: cpu_percent, memory_mb (sum GPU), gpu_util_percent (avg), device_count
 
-Supports multiple GPU libraries (GPUtil, pynvml, torch) with automatic fallback.
+Public API used by your tracker:
+- start_monitoring(experiment_id: str|None)
+- stop_monitoring()
+- get_current_usage()  -> includes top-level summary keys
+- get_usage_history(minutes=10)
+- get_performance_summary()
+- get_optimization_recommendations()
+- export_monitoring_data(filepath, include_history=True)
 """
+
+from __future__ import annotations
 
 import time
 import threading
@@ -20,732 +29,648 @@ from typing import Dict, Any, List, Optional, Tuple
 from collections import deque
 import json
 
-# GPU monitoring library imports with fallback
-GPU_LIBRARIES = []
+# Optional deps
+GPU_LIBRARIES: List[str] = []
 
 try:
-    import GPUtil
-    GPU_LIBRARIES.append('GPUtil')
-except ImportError:
+    import GPUtil  # type: ignore
+    GPU_LIBRARIES.append("GPUtil")
+except Exception:
     GPUtil = None
 
 try:
-    import pynvml
-    GPU_LIBRARIES.append('pynvml')
-except ImportError:
+    import pynvml  # type: ignore
+    GPU_LIBRARIES.append("pynvml")
+except Exception:
     pynvml = None
 
 try:
-    import torch
+    import torch  # type: ignore
     if torch.cuda.is_available():
-        GPU_LIBRARIES.append('torch')
-except ImportError:
+        GPU_LIBRARIES.append("torch")
+except Exception:
     torch = None
 
 try:
-    import psutil
+    import psutil  # type: ignore
     PSUTIL_AVAILABLE = True
-except ImportError:
+except Exception:
     psutil = None
     PSUTIL_AVAILABLE = False
 
+try:
+    from prometheus_client import start_http_server, Gauge, CollectorRegistry  # type: ignore
+    PROM_AVAILABLE = True
+except Exception:
+    PROM_AVAILABLE = False
+
 
 class GPUMonitor:
-    """
-    Comprehensive GPU monitoring system
-    
-    This class provides:
-    - Real-time GPU metrics collection
-    - Multi-GPU system support
-    - Historical data tracking
-    - Performance analysis and recommendations
-    - Resource bottleneck detection
-    - Integration with experiment tracking
-    """
-    
+    """Comprehensive GPU + system monitor with safe fallbacks."""
+
+    # Alert thresholds (can be tweaked at runtime if needed)
+    THRESH_GPU_MEM_CRIT = 90.0
+    THRESH_GPU_TEMP_HIGH = 80.0
+    THRESH_GPU_UNDERUTIL = 20.0
+    THRESH_CPU_HIGH = 90.0
+    THRESH_SYS_MEM_HIGH = 90.0
+
     def __init__(self, sampling_interval: float = 1.0, history_size: int = 1000):
         """
-        Initialize GPU monitor
-        
         Args:
-            sampling_interval: Seconds between measurements
-            history_size: Number of historical samples to keep
+            sampling_interval: seconds between samples
+            history_size: number of samples to retain in memory
         """
-        self.sampling_interval = sampling_interval
-        self.history_size = history_size
-        
-        # GPU detection and library selection
-        self.gpu_library = None
+        self.sampling_interval = float(sampling_interval)
+        self.history_size = int(history_size)
+
+        # GPU detection
+        self.gpu_library: Optional[str] = None
         self.device_count = 0
-        self.devices_info = []
-        
+        self.devices_info: List[Dict[str, Any]] = []
+
         # Monitoring state
         self.is_monitoring = False
-        self.monitor_thread = None
-        self.experiment_id = None
-        
-        # Data storage
-        self.gpu_history = deque(maxlen=history_size)
-        self.system_history = deque(maxlen=history_size)
-        
-        # Performance tracking
-        self.alerts = []
-        self.bottlenecks_detected = []
-        
-        # Initialize GPU detection
+        self.monitor_thread: Optional[threading.Thread] = None
+        self.experiment_id: Optional[str] = None
+
+        # Data buffers
+        self._lock = threading.Lock()
+        self.gpu_history: deque = deque(maxlen=self.history_size)
+        self.system_history: deque = deque(maxlen=self.history_size)
+        self.alerts: List[Dict[str, Any]] = []
+
+        # Prometheus
+        self._prom_registry: Optional[CollectorRegistry] = None
+        self._prom_started = False
+
         self._detect_gpus()
-        
-        print(f"🎮 GPU Monitor initialized")
+
+        print("🎮 GPU Monitor initialized")
         print(f"   GPUs detected: {self.device_count}")
-        print(f"   Library: {self.gpu_library}")
-        print(f"   Sampling: {sampling_interval}s")
-    
-    def _detect_gpus(self):
-        """Detect available GPUs and select monitoring library"""
-        # Try GPUtil first (most comprehensive)
-        if 'GPUtil' in GPU_LIBRARIES:
+        print(f"   Library: {self.gpu_library or 'none'}")
+        print(f"   Sampling: {self.sampling_interval}s")
+
+    # ---------------------------
+    # Detection
+    # ---------------------------
+    def _detect_gpus(self) -> None:
+        """Detect available GPUs and choose the best library."""
+        # Try GPUtil first
+        if "GPUtil" in GPU_LIBRARIES:
             try:
                 gpus = GPUtil.getGPUs()
                 if gpus:
-                    self.gpu_library = 'GPUtil'
+                    self.gpu_library = "GPUtil"
                     self.device_count = len(gpus)
                     self.devices_info = [
                         {
-                            'id': gpu.id,
-                            'name': gpu.name,
-                            'memory_total': gpu.memoryTotal,
-                            'driver_version': getattr(gpu, 'driver', 'unknown')
+                            "id": g.id,
+                            "name": g.name,
+                            "memory_total_mb": getattr(g, "memoryTotal", None),
+                            "driver_version": getattr(g, "driver", None),
                         }
-                        for gpu in gpus
+                        for g in gpus
                     ]
                     return
             except Exception as e:
                 print(f"⚠️ GPUtil detection failed: {e}")
-        
-        # Try pynvml (NVIDIA management library)
-        if 'pynvml' in GPU_LIBRARIES:
+
+        # Then try NVML
+        if "pynvml" in GPU_LIBRARIES:
             try:
                 pynvml.nvmlInit()
-                device_count = pynvml.nvmlDeviceGetCount()
-                if device_count > 0:
-                    self.gpu_library = 'pynvml'
-                    self.device_count = device_count
+                n = pynvml.nvmlDeviceGetCount()
+                if n > 0:
+                    self.gpu_library = "pynvml"
+                    self.device_count = n
                     self.devices_info = []
-                    
-                    for i in range(device_count):
-                        handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-                        name = pynvml.nvmlDeviceGetName(handle).decode('utf-8')
-                        memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                        
-                        self.devices_info.append({
-                            'id': i,
-                            'name': name,
-                            'memory_total': memory_info.total // (1024**2),  # MB
-                            'driver_version': pynvml.nvmlSystemGetDriverVersion().decode('utf-8')
-                        })
+                    # driver once
+                    try:
+                        driver = pynvml.nvmlSystemGetDriverVersion().decode("utf-8")
+                    except Exception:
+                        driver = None
+                    for i in range(n):
+                        h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                        name = pynvml.nvmlDeviceGetName(h).decode("utf-8")
+                        mem = pynvml.nvmlDeviceGetMemoryInfo(h)
+                        self.devices_info.append(
+                            {
+                                "id": i,
+                                "name": name,
+                                "memory_total_mb": mem.total // (1024 ** 2),
+                                "driver_version": driver,
+                            }
+                        )
+                    # leave NVML initialized for runtime queries
                     return
             except Exception as e:
-                print(f"⚠️ pynvml detection failed: {e}")
-        
-        # Try PyTorch CUDA
-        if 'torch' in GPU_LIBRARIES:
+                print(f"⚠️ NVML detection failed: {e}")
+                try:
+                    pynvml.nvmlShutdown()
+                except Exception:
+                    pass
+
+        # Then torch CUDA
+        if "torch" in GPU_LIBRARIES:
             try:
-                device_count = torch.cuda.device_count()
-                if device_count > 0:
-                    self.gpu_library = 'torch'
-                    self.device_count = device_count
+                n = torch.cuda.device_count()
+                if n > 0:
+                    self.gpu_library = "torch"
+                    self.device_count = n
                     self.devices_info = []
-                    
-                    for i in range(device_count):
-                        props = torch.cuda.get_device_properties(i)
-                        self.devices_info.append({
-                            'id': i,
-                            'name': props.name,
-                            'memory_total': props.total_memory // (1024**2),  # MB
-                            'compute_capability': f"{props.major}.{props.minor}"
-                        })
+                    for i in range(n):
+                        p = torch.cuda.get_device_properties(i)
+                        self.devices_info.append(
+                            {
+                                "id": i,
+                                "name": p.name,
+                                "memory_total_mb": p.total_memory // (1024 ** 2),
+                                "compute_capability": f"{p.major}.{p.minor}",
+                            }
+                        )
                     return
             except Exception as e:
                 print(f"⚠️ PyTorch CUDA detection failed: {e}")
-        
-        # No GPUs detected
-        print("ℹ️ No GPUs detected or GPU libraries unavailable")
-    
-    def start_monitoring(self, experiment_id: str = None):
-        """
-        Start GPU monitoring in background thread
-        
-        Args:
-            experiment_id: Optional experiment identifier for logging
-        """
+
+        # No GPUs or libs
+        self.gpu_library = None
+        self.device_count = 0
+        self.devices_info = []
+        print("ℹ️ No GPUs detected or GPU libs unavailable")
+
+    # ---------------------------
+    # Control
+    # ---------------------------
+    def start_monitoring(self, experiment_id: str | None = None, *, prometheus_port: Optional[int] = None) -> None:
         if self.is_monitoring:
             print("⚠️ GPU monitoring already active")
             return
-        
-        if self.device_count == 0:
-            print("⚠️ No GPUs available for monitoring")
-            return
-        
+
+        # Even if no GPUs, we still monitor system metrics
         self.experiment_id = experiment_id
         self.is_monitoring = True
-        
-        # Start monitoring thread
-        self.monitor_thread = threading.Thread(
-            target=self._monitoring_loop,
-            daemon=True,
-            name="GPUMonitor"
-        )
+
+        if PROM_AVAILABLE and prometheus_port is not None and not self._prom_started:
+            self._start_prometheus(prometheus_port)
+
+        self.monitor_thread = threading.Thread(target=self._monitoring_loop, daemon=True, name="GPUMonitor")
         self.monitor_thread.start()
-        
-        print(f"📈 Started GPU monitoring for {self.device_count} devices")
-    
-    def stop_monitoring(self):
-        """Stop GPU monitoring"""
+        print(f"📈 Started monitoring (GPUs: {self.device_count}, prom: {self._prom_started})")
+
+    def stop_monitoring(self) -> None:
         if not self.is_monitoring:
             return
-        
         self.is_monitoring = False
-        
         if self.monitor_thread and self.monitor_thread.is_alive():
             self.monitor_thread.join(timeout=5.0)
-        
-        print("📊 Stopped GPU monitoring")
-    
-    def _monitoring_loop(self):
-        """Main monitoring loop running in background thread"""
-        while self.is_monitoring:
+        # NVML shutdown if we were using it
+        if self.gpu_library == "pynvml":
             try:
-                # Collect GPU metrics
-                gpu_metrics = self._collect_gpu_metrics()
-                system_metrics = self._collect_system_metrics()
-                
-                timestamp = datetime.now()
-                
-                # Store metrics
-                if gpu_metrics:
-                    self.gpu_history.append({
-                        'timestamp': timestamp,
-                        'metrics': gpu_metrics
-                    })
-                
-                if system_metrics:
-                    self.system_history.append({
-                        'timestamp': timestamp,
-                        'metrics': system_metrics
-                    })
-                
-                # Check for performance issues
-                self._analyze_performance(gpu_metrics, system_metrics)
-                
-                # Sleep until next sampling
-                time.sleep(self.sampling_interval)
-                
-            except Exception as e:
-                print(f"❌ Error in GPU monitoring loop: {e}")
-                time.sleep(self.sampling_interval)
-    
-    def _collect_gpu_metrics(self) -> List[Dict[str, Any]]:
-        """Collect metrics from all GPU devices"""
-        if not self.gpu_library:
-            return []
-        
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+        print("📊 Stopped GPU monitoring")
+
+    # ---------------------------
+    # Prometheus (optional)
+    # ---------------------------
+    def _start_prometheus(self, port: int) -> None:
         try:
-            if self.gpu_library == 'GPUtil':
+            self._prom_registry = CollectorRegistry()
+            # Define gauges
+            self.g_gpu_util = Gauge("lezea_gpu_utilization_percent", "GPU utilization", ["gpu_id"], registry=self._prom_registry)
+            self.g_gpu_mem_used = Gauge("lezea_gpu_memory_used_mb", "GPU memory used (MB)", ["gpu_id"], registry=self._prom_registry)
+            self.g_gpu_mem_pct = Gauge("lezea_gpu_memory_percent", "GPU memory percent", ["gpu_id"], registry=self._prom_registry)
+            self.g_gpu_temp = Gauge("lezea_gpu_temperature_c", "GPU temperature (C)", ["gpu_id"], registry=self._prom_registry)
+            self.g_sys_cpu = Gauge("lezea_system_cpu_percent", "System CPU percent", registry=self._prom_registry)
+            self.g_sys_mem = Gauge("lezea_system_memory_percent", "System memory percent", registry=self._prom_registry)
+
+            start_http_server(port, registry=self._prom_registry)
+            self._prom_started = True
+            print(f"🛰️ Prometheus exporter started on :{port}")
+        except Exception as e:
+            print(f"⚠️ Prometheus init failed: {e}")
+            self._prom_started = False
+            self._prom_registry = None
+
+    def _update_prometheus(self, gpu_metrics: List[Dict[str, Any]], sys_metrics: Dict[str, Any]) -> None:
+        if not self._prom_started:
+            return
+        try:
+            for m in gpu_metrics:
+                gpu_id = str(m.get("device_id", -1))
+                if "utilization_percent" in m:
+                    self.g_gpu_util.labels(gpu_id).set(m["utilization_percent"])
+                if "memory_used_mb" in m:
+                    self.g_gpu_mem_used.labels(gpu_id).set(m["memory_used_mb"])
+                if "memory_percent" in m:
+                    self.g_gpu_mem_pct.labels(gpu_id).set(m["memory_percent"])
+                if "temperature_c" in m:
+                    self.g_gpu_temp.labels(gpu_id).set(m["temperature_c"])
+            if "cpu_percent" in sys_metrics:
+                self.g_sys_cpu.set(sys_metrics["cpu_percent"])
+            if "memory_percent" in sys_metrics:
+                self.g_sys_mem.set(sys_metrics["memory_percent"])
+        except Exception:
+            pass
+
+    # ---------------------------
+    # Loop & collectors
+    # ---------------------------
+    def _monitoring_loop(self) -> None:
+        while self.is_monitoring:
+            t0 = time.time()
+            try:
+                gpu_metrics = self._collect_gpu_metrics()
+                sys_metrics = self._collect_system_metrics()
+                ts = datetime.now()
+
+                with self._lock:
+                    if gpu_metrics:
+                        self.gpu_history.append({"timestamp": ts, "metrics": gpu_metrics})
+                    if sys_metrics:
+                        self.system_history.append({"timestamp": ts, "metrics": sys_metrics})
+                    self._analyze_performance(gpu_metrics, sys_metrics)
+
+                self._update_prometheus(gpu_metrics, sys_metrics)
+
+            except Exception as e:
+                print(f"❌ Error in monitor loop: {e}")
+
+            # Sleep exactly to interval (account for work time)
+            elapsed = time.time() - t0
+            delay = max(0.0, self.sampling_interval - elapsed)
+            time.sleep(delay)
+
+    def _collect_gpu_metrics(self) -> List[Dict[str, Any]]:
+        if not self.gpu_library or self.device_count == 0:
+            return []
+        try:
+            if self.gpu_library == "GPUtil":
                 return self._collect_gputil_metrics()
-            elif self.gpu_library == 'pynvml':
+            elif self.gpu_library == "pynvml":
                 return self._collect_pynvml_metrics()
-            elif self.gpu_library == 'torch':
+            elif self.gpu_library == "torch":
                 return self._collect_torch_metrics()
         except Exception as e:
-            print(f"❌ Failed to collect GPU metrics: {e}")
-            return []
-    
+            print(f"❌ GPU metrics error: {e}")
+        return []
+
     def _collect_gputil_metrics(self) -> List[Dict[str, Any]]:
-        """Collect metrics using GPUtil"""
         gpus = GPUtil.getGPUs()
-        metrics = []
-        
-        for gpu in gpus:
-            gpu_metrics = {
-                'device_id': gpu.id,
-                'name': gpu.name,
-                'utilization_percent': round(gpu.load * 100, 1),
-                'memory_used_mb': round(gpu.memoryUsed, 1),
-                'memory_total_mb': round(gpu.memoryTotal, 1),
-                'memory_free_mb': round(gpu.memoryFree, 1),
-                'memory_percent': round((gpu.memoryUsed / gpu.memoryTotal) * 100, 1),
-                'temperature_c': gpu.temperature
-            }
-            metrics.append(gpu_metrics)
-        
-        return metrics
-    
+        out: List[Dict[str, Any]] = []
+        for g in gpus:
+            mem_pct = (g.memoryUsed / g.memoryTotal) * 100 if getattr(g, "memoryTotal", 0) else 0.0
+            out.append(
+                {
+                    "device_id": g.id,
+                    "name": g.name,
+                    "utilization_percent": round(getattr(g, "load", 0.0) * 100, 1),
+                    "memory_used_mb": round(getattr(g, "memoryUsed", 0.0), 1),
+                    "memory_total_mb": round(getattr(g, "memoryTotal", 0.0), 1),
+                    "memory_free_mb": round(getattr(g, "memoryFree", 0.0), 1),
+                    "memory_percent": round(mem_pct, 1),
+                    "temperature_c": getattr(g, "temperature", None),
+                }
+            )
+        return out
+
     def _collect_pynvml_metrics(self) -> List[Dict[str, Any]]:
-        """Collect metrics using pynvml"""
-        metrics = []
-        
+        out: List[Dict[str, Any]] = []
         for i in range(self.device_count):
             try:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-                
-                # GPU utilization
-                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                
-                # Memory info
-                memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-                
-                # Temperature
+                h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                util = pynvml.nvmlDeviceGetUtilizationRates(h)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(h)
                 try:
-                    temperature = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
-                except:
-                    temperature = 0
-                
-                # Power usage
+                    temp = pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)
+                except Exception:
+                    temp = None
                 try:
-                    power = pynvml.nvmlDeviceGetPowerUsage(handle) // 1000  # mW to W
-                except:
-                    power = 0
-                
-                # Clock speeds
+                    power_w = pynvml.nvmlDeviceGetPowerUsage(h) // 1000
+                except Exception:
+                    power_w = None
                 try:
-                    graphics_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_GRAPHICS)
-                    memory_clock = pynvml.nvmlDeviceGetClockInfo(handle, pynvml.NVML_CLOCK_MEM)
-                except:
-                    graphics_clock = memory_clock = 0
-                
-                gpu_metrics = {
-                    'device_id': i,
-                    'name': pynvml.nvmlDeviceGetName(handle).decode('utf-8'),
-                    'utilization_percent': util.gpu,
-                    'memory_utilization_percent': util.memory,
-                    'memory_used_mb': round(memory_info.used / (1024**2), 1),
-                    'memory_total_mb': round(memory_info.total / (1024**2), 1),
-                    'memory_free_mb': round(memory_info.free / (1024**2), 1),
-                    'memory_percent': round((memory_info.used / memory_info.total) * 100, 1),
-                    'temperature_c': temperature,
-                    'power_usage_w': power,
-                    'graphics_clock_mhz': graphics_clock,
-                    'memory_clock_mhz': memory_clock
-                }
-                metrics.append(gpu_metrics)
-                
+                    gclk = pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_GRAPHICS)
+                    mclk = pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_MEM)
+                except Exception:
+                    gclk = mclk = None
+
+                mem_pct = (mem.used / mem.total) * 100 if mem.total else 0.0
+                out.append(
+                    {
+                        "device_id": i,
+                        "name": pynvml.nvmlDeviceGetName(h).decode("utf-8"),
+                        "utilization_percent": float(util.gpu),
+                        "memory_utilization_percent": float(util.memory),
+                        "memory_used_mb": round(mem.used / (1024 ** 2), 1),
+                        "memory_total_mb": round(mem.total / (1024 ** 2), 1),
+                        "memory_free_mb": round(mem.free / (1024 ** 2), 1),
+                        "memory_percent": round(mem_pct, 1),
+                        "temperature_c": temp,
+                        "power_usage_w": power_w,
+                        "graphics_clock_mhz": gclk,
+                        "memory_clock_mhz": mclk,
+                    }
+                )
             except Exception as e:
-                print(f"⚠️ Failed to get metrics for GPU {i}: {e}")
-        
-        return metrics
-    
+                print(f"⚠️ NVML metrics failed for GPU {i}: {e}")
+        return out
+
     def _collect_torch_metrics(self) -> List[Dict[str, Any]]:
-        """Collect metrics using PyTorch"""
-        metrics = []
-        
+        out: List[Dict[str, Any]] = []
         for i in range(self.device_count):
             try:
-                # Memory info
-                memory_allocated = torch.cuda.memory_allocated(i)
-                memory_reserved = torch.cuda.memory_reserved(i)
-                memory_total = torch.cuda.get_device_properties(i).total_memory
-                
-                gpu_metrics = {
-                    'device_id': i,
-                    'name': torch.cuda.get_device_name(i),
-                    'memory_allocated_mb': round(memory_allocated / (1024**2), 1),
-                    'memory_reserved_mb': round(memory_reserved / (1024**2), 1),
-                    'memory_total_mb': round(memory_total / (1024**2), 1),
-                    'memory_percent': round((memory_reserved / memory_total) * 100, 1)
+                total = torch.cuda.get_device_properties(i).total_memory
+                allocated = torch.cuda.memory_allocated(i)
+                reserved = torch.cuda.memory_reserved(i)
+                mem_used = reserved or allocated
+                mem_pct = (mem_used / total) * 100 if total else 0.0
+                row = {
+                    "device_id": i,
+                    "name": torch.cuda.get_device_name(i),
+                    "memory_allocated_mb": round(allocated / (1024 ** 2), 1),
+                    "memory_reserved_mb": round(reserved / (1024 ** 2), 1),
+                    "memory_total_mb": round(total / (1024 ** 2), 1),
+                    "memory_used_mb": round(mem_used / (1024 ** 2), 1),
+                    "memory_percent": round(mem_pct, 1),
                 }
-                
-                # Try to get utilization if possible
-                try:
-                    utilization = torch.cuda.utilization(i)
-                    gpu_metrics['utilization_percent'] = utilization
-                except:
-                    pass
-                
-                metrics.append(gpu_metrics)
-                
+                # Utilization is not generally available in torch; skip unless present
+                out.append(row)
             except Exception as e:
-                print(f"⚠️ Failed to get PyTorch metrics for GPU {i}: {e}")
-        
-        return metrics
-    
+                print(f"⚠️ Torch metrics failed for GPU {i}: {e}")
+        return out
+
     def _collect_system_metrics(self) -> Dict[str, Any]:
-        """Collect system-wide metrics"""
         if not PSUTIL_AVAILABLE:
             return {}
-        
         try:
-            # CPU metrics
-            cpu_percent = psutil.cpu_percent(interval=None)
+            cpu_percent = psutil.cpu_percent(interval=0.0)  # non-blocking
             cpu_count = psutil.cpu_count()
-            
-            # Memory metrics
-            memory = psutil.virtual_memory()
-            
-            # System load
+            mem = psutil.virtual_memory()
             try:
-                load_avg = psutil.getloadavg()
-            except:
-                load_avg = (0, 0, 0)
-            
+                load1, load5, load15 = psutil.getloadavg()
+            except Exception:
+                load1 = load5 = load15 = 0.0
             return {
-                'cpu_percent': cpu_percent,
-                'cpu_count': cpu_count,
-                'memory_percent': memory.percent,
-                'memory_used_gb': round(memory.used / (1024**3), 2),
-                'memory_total_gb': round(memory.total / (1024**3), 2),
-                'load_avg_1m': load_avg[0],
-                'load_avg_5m': load_avg[1],
-                'load_avg_15m': load_avg[2]
+                "cpu_percent": cpu_percent,
+                "cpu_count": cpu_count,
+                "memory_percent": mem.percent,
+                "memory_used_gb": round(mem.used / (1024 ** 3), 2),
+                "memory_total_gb": round(mem.total / (1024 ** 3), 2),
+                "load_avg_1m": load1,
+                "load_avg_5m": load5,
+                "load_avg_15m": load15,
             }
-            
         except Exception as e:
-            print(f"⚠️ Failed to collect system metrics: {e}")
+            print(f"⚠️ System metrics failed: {e}")
             return {}
-    
-    def _analyze_performance(self, gpu_metrics: List[Dict], system_metrics: Dict):
-        """Analyze performance and detect bottlenecks"""
+
+    # ---------------------------
+    # Analysis & alerts
+    # ---------------------------
+    def _analyze_performance(self, gpus: List[Dict[str, Any]], system: Dict[str, Any]) -> None:
         try:
-            current_time = datetime.now()
-            
-            # GPU performance analysis
-            for gpu_metric in gpu_metrics:
-                device_id = gpu_metric['device_id']
-                
-                # High memory usage warning
-                memory_percent = gpu_metric.get('memory_percent', 0)
-                if memory_percent > 90:
-                    alert = {
-                        'timestamp': current_time,
-                        'type': 'gpu_memory_high',
-                        'device_id': device_id,
-                        'value': memory_percent,
-                        'message': f"GPU {device_id} memory usage critical: {memory_percent:.1f}%"
-                    }
-                    self.alerts.append(alert)
-                
-                # High temperature warning
-                temperature = gpu_metric.get('temperature_c', 0)
-                if temperature > 80:
-                    alert = {
-                        'timestamp': current_time,
-                        'type': 'gpu_temperature_high',
-                        'device_id': device_id,
-                        'value': temperature,
-                        'message': f"GPU {device_id} temperature high: {temperature}°C"
-                    }
-                    self.alerts.append(alert)
-                
-                # Low utilization warning (potential bottleneck)
-                utilization = gpu_metric.get('utilization_percent', 0)
-                if utilization < 20 and memory_percent > 50:
-                    alert = {
-                        'timestamp': current_time,
-                        'type': 'gpu_underutilized',
-                        'device_id': device_id,
-                        'utilization': utilization,
-                        'memory': memory_percent,
-                        'message': f"GPU {device_id} underutilized: {utilization:.1f}% usage, {memory_percent:.1f}% memory"
-                    }
-                    self.alerts.append(alert)
-            
-            # System bottleneck detection
-            cpu_percent = system_metrics.get('cpu_percent', 0)
-            memory_percent = system_metrics.get('memory_percent', 0)
-            
-            if cpu_percent > 90:
-                alert = {
-                    'timestamp': current_time,
-                    'type': 'cpu_high',
-                    'value': cpu_percent,
-                    'message': f"High CPU usage: {cpu_percent:.1f}%"
-                }
-                self.alerts.append(alert)
-            
-            if memory_percent > 90:
-                alert = {
-                    'timestamp': current_time,
-                    'type': 'memory_high',
-                    'value': memory_percent,
-                    'message': f"High system memory usage: {memory_percent:.1f}%"
-                }
-                self.alerts.append(alert)
-            
-            # Keep only recent alerts (last 100)
-            self.alerts = self.alerts[-100:]
-            
-        except Exception as e:
-            print(f"⚠️ Performance analysis failed: {e}")
-    
+            now = datetime.now()
+            # GPU alerts
+            for m in gpus:
+                did = m.get("device_id")
+                mem_pct = float(m.get("memory_percent", 0.0))
+                if mem_pct > self.THRESH_GPU_MEM_CRIT:
+                    self._push_alert(now, "gpu_memory_high", f"GPU {did} memory critical: {mem_pct:.1f}%", device_id=did, value=mem_pct)
+                temp = m.get("temperature_c")
+                if isinstance(temp, (int, float)) and temp > self.THRESH_GPU_TEMP_HIGH:
+                    self._push_alert(now, "gpu_temperature_high", f"GPU {did} temp high: {temp}°C", device_id=did, value=float(temp))
+                util = float(m.get("utilization_percent", 0.0))
+                if util < self.THRESH_GPU_UNDERUTIL and mem_pct > 50.0:
+                    self._push_alert(
+                        now,
+                        "gpu_underutilized",
+                        f"GPU {did} underutilized: {util:.1f}% (mem {mem_pct:.1f}%)",
+                        device_id=did,
+                        utilization=util,
+                        memory=mem_pct,
+                    )
+
+            # System alerts
+            cpu_pct = float(system.get("cpu_percent", 0.0))
+            if cpu_pct > self.THRESH_CPU_HIGH:
+                self._push_alert(now, "cpu_high", f"CPU usage high: {cpu_pct:.1f}%", value=cpu_pct)
+            sys_mem_pct = float(system.get("memory_percent", 0.0))
+            if sys_mem_pct > self.THRESH_SYS_MEM_HIGH:
+                self._push_alert(now, "memory_high", f"System memory high: {sys_mem_pct:.1f}%", value=sys_mem_pct)
+
+            # Trim alerts
+            if len(self.alerts) > 100:
+                self.alerts = self.alerts[-100:]
+        except Exception:
+            pass
+
+    def _push_alert(self, ts: datetime, typ: str, message: str, **kwargs: Any) -> None:
+        self.alerts.append({"timestamp": ts, "type": typ, "message": message, **kwargs})
+
+    # ---------------------------
+    # Public getters
+    # ---------------------------
     def get_current_usage(self) -> Dict[str, Any]:
-        """Get current GPU and system usage"""
+        """
+        Return the latest snapshot. Includes a convenient top-level summary:
+          - cpu_percent (system)
+          - memory_mb (sum of GPU used MB)
+          - gpu_util_percent (avg across devices if available)
+          - device_count
+        """
         try:
-            gpu_metrics = self._collect_gpu_metrics()
-            system_metrics = self._collect_system_metrics()
-            
+            g = self._collect_gpu_metrics()
+            s = self._collect_system_metrics()
+
+            # Summary for tracker
+            total_gpu_mem_mb = 0.0
+            util_vals: List[float] = []
+            for m in g:
+                total_gpu_mem_mb += float(m.get("memory_used_mb", 0.0))
+                if "utilization_percent" in m:
+                    util_vals.append(float(m["utilization_percent"]))
+            avg_util = sum(util_vals) / len(util_vals) if util_vals else 0.0
+
             return {
-                'timestamp': datetime.now().isoformat(),
-                'gpu_devices': gpu_metrics,
-                'system': system_metrics,
-                'device_count': self.device_count
+                "timestamp": datetime.now().isoformat(),
+                "gpu_devices": g,
+                "system": s,
+                "device_count": self.device_count,
+                # Tracker-friendly rollups:
+                "cpu_percent": float(s.get("cpu_percent", 0.0)),
+                "memory_mb": round(total_gpu_mem_mb, 2),
+                "gpu_util_percent": round(avg_util, 2),
             }
-            
         except Exception as e:
-            print(f"❌ Failed to get current usage: {e}")
+            print(f"❌ Snapshot failed: {e}")
             return {}
-    
+
     def get_usage_history(self, minutes: int = 10) -> Dict[str, Any]:
-        """
-        Get usage history for the last N minutes
-        
-        Args:
-            minutes: Number of minutes of history to return
-        
-        Returns:
-            Dictionary with historical usage data
-        """
         try:
-            cutoff_time = datetime.now() - timedelta(minutes=minutes)
-            
-            # Filter recent GPU history
-            recent_gpu = [
-                entry for entry in self.gpu_history
-                if entry['timestamp'] > cutoff_time
-            ]
-            
-            # Filter recent system history
-            recent_system = [
-                entry for entry in self.system_history
-                if entry['timestamp'] > cutoff_time
-            ]
-            
+            cutoff = datetime.now() - timedelta(minutes=minutes)
+            with self._lock:
+                rg = [e for e in self.gpu_history if e["timestamp"] > cutoff]
+                rs = [e for e in self.system_history if e["timestamp"] > cutoff]
             return {
-                'time_range_minutes': minutes,
-                'gpu_history': [
-                    {
-                        'timestamp': entry['timestamp'].isoformat(),
-                        'metrics': entry['metrics']
-                    }
-                    for entry in recent_gpu
-                ],
-                'system_history': [
-                    {
-                        'timestamp': entry['timestamp'].isoformat(),
-                        'metrics': entry['metrics']
-                    }
-                    for entry in recent_system
-                ],
-                'sample_count': len(recent_gpu)
+                "time_range_minutes": minutes,
+                "gpu_history": [{"timestamp": e["timestamp"].isoformat(), "metrics": e["metrics"]} for e in rg],
+                "system_history": [{"timestamp": e["timestamp"].isoformat(), "metrics": e["metrics"]} for e in rs],
+                "sample_count": len(rg),
             }
-            
         except Exception as e:
-            print(f"❌ Failed to get usage history: {e}")
+            print(f"❌ History failed: {e}")
             return {}
-    
+
     def get_performance_summary(self) -> Dict[str, Any]:
-        """Get performance summary and statistics"""
         try:
-            if not self.gpu_history:
-                return {'error': 'No monitoring data available'}
-            
-            # Calculate averages for each GPU
-            gpu_stats = {}
-            
-            for entry in self.gpu_history:
-                for gpu_metric in entry['metrics']:
-                    device_id = gpu_metric['device_id']
-                    if device_id not in gpu_stats:
-                        gpu_stats[device_id] = {
-                            'utilization_samples': [],
-                            'memory_samples': [],
-                            'temperature_samples': []
-                        }
-                    
-                    gpu_stats[device_id]['utilization_samples'].append(
-                        gpu_metric.get('utilization_percent', 0)
-                    )
-                    gpu_stats[device_id]['memory_samples'].append(
-                        gpu_metric.get('memory_percent', 0)
-                    )
-                    if 'temperature_c' in gpu_metric:
-                        gpu_stats[device_id]['temperature_samples'].append(
-                            gpu_metric['temperature_c']
-                        )
-            
-            # Calculate statistics
-            summary = {
-                'monitoring_duration_minutes': len(self.gpu_history) * self.sampling_interval / 60,
-                'sample_count': len(self.gpu_history),
-                'devices': {}
-            }
-            
-            for device_id, stats in gpu_stats.items():
-                if stats['utilization_samples']:
-                    device_summary = {
-                        'avg_utilization': round(sum(stats['utilization_samples']) / len(stats['utilization_samples']), 1),
-                        'max_utilization': round(max(stats['utilization_samples']), 1),
-                        'avg_memory_usage': round(sum(stats['memory_samples']) / len(stats['memory_samples']), 1),
-                        'max_memory_usage': round(max(stats['memory_samples']), 1)
-                    }
-                    
-                    if stats['temperature_samples']:
-                        device_summary.update({
-                            'avg_temperature': round(sum(stats['temperature_samples']) / len(stats['temperature_samples']), 1),
-                            'max_temperature': round(max(stats['temperature_samples']), 1)
-                        })
-                    
-                    summary['devices'][device_id] = device_summary
-            
-            # Add alert summary
-            recent_alerts = [
-                alert for alert in self.alerts
-                if alert['timestamp'] > datetime.now() - timedelta(minutes=30)
-            ]
-            
-            summary['recent_alerts'] = len(recent_alerts)
-            summary['alert_types'] = list(set(alert['type'] for alert in recent_alerts))
-            
-            return summary
-            
+            with self._lock:
+                if not self.gpu_history:
+                    # Still include system part
+                    sys_sum = {}
+                    if self.system_history:
+                        sys_sum = self.system_history[-1]["metrics"]
+                    return {"error": "No GPU samples yet", "system": sys_sum}
+
+                gpu_stats: Dict[int, Dict[str, List[float]]] = {}
+                for entry in self.gpu_history:
+                    for m in entry["metrics"]:
+                        did = int(m.get("device_id", -1))
+                        bucket = gpu_stats.setdefault(did, {"util": [], "mem": [], "temp": []})
+                        if "utilization_percent" in m:
+                            bucket["util"].append(float(m["utilization_percent"]))
+                        if "memory_percent" in m:
+                            bucket["mem"].append(float(m["memory_percent"]))
+                        if "temperature_c" in m and isinstance(m["temperature_c"], (int, float)):
+                            bucket["temp"].append(float(m["temperature_c"]))
+
+                devices: Dict[str, Any] = {}
+                for did, b in gpu_stats.items():
+                    dev: Dict[str, Any] = {}
+                    if b["util"]:
+                        dev["avg_utilization"] = round(sum(b["util"]) / len(b["util"]), 1)
+                        dev["max_utilization"] = round(max(b["util"]), 1)
+                    if b["mem"]:
+                        dev["avg_memory_usage"] = round(sum(b["mem"]) / len(b["mem"]), 1)
+                        dev["max_memory_usage"] = round(max(b["mem"]), 1)
+                    if b["temp"]:
+                        dev["avg_temperature"] = round(sum(b["temp"]) / len(b["temp"]), 1)
+                        dev["max_temperature"] = round(max(b["temp"]), 1)
+                    devices[str(did)] = dev
+
+                duration_min = len(self.gpu_history) * self.sampling_interval / 60.0
+                recent_alerts = [a for a in self.alerts if a["timestamp"] > datetime.now() - timedelta(minutes=30)]
+                return {
+                    "monitoring_duration_minutes": round(duration_min, 2),
+                    "sample_count": len(self.gpu_history),
+                    "devices": devices,
+                    "recent_alerts": len(recent_alerts),
+                    "alert_types": sorted(set(a["type"] for a in recent_alerts)),
+                }
         except Exception as e:
-            print(f"❌ Failed to get performance summary: {e}")
-            return {'error': str(e)}
-    
+            print(f"❌ Summary failed: {e}")
+            return {"error": str(e)}
+
     def get_optimization_recommendations(self) -> List[str]:
-        """Get optimization recommendations based on monitoring data"""
-        recommendations = []
-        
+        recs: List[str] = []
         try:
-            if not self.gpu_history:
-                return ["No monitoring data available for recommendations"]
-            
-            current_usage = self.get_current_usage()
-            gpu_devices = current_usage.get('gpu_devices', [])
-            
-            for gpu in gpu_devices:
-                device_id = gpu['device_id']
-                utilization = gpu.get('utilization_percent', 0)
-                memory_percent = gpu.get('memory_percent', 0)
-                
-                # Low utilization recommendations
-                if utilization < 30 and memory_percent > 60:
-                    recommendations.append(
-                        f"GPU {device_id}: Low utilization ({utilization:.1f}%) with high memory usage ({memory_percent:.1f}%) - "
-                        "consider increasing batch size or model complexity"
+            snap = self.get_current_usage()
+            gpus = snap.get("gpu_devices", [])
+            sysm = snap.get("system", {})
+
+            if not gpus:
+                return ["No GPU data available; utilization looks CPU-bound or system has no CUDA devices."]
+
+            for m in gpus:
+                did = m.get("device_id")
+                util = float(m.get("utilization_percent", 0.0))
+                mp = float(m.get("memory_percent", 0.0))
+                temp = m.get("temperature_c", None)
+
+                if util < 30 and mp > 60:
+                    recs.append(
+                        f"GPU {did}: low util ({util:.1f}%) but high memory ({mp:.1f}%). "
+                        "Consider larger batch size, fused kernels, or overlapping data transfer/compute."
                     )
-                
-                # High memory usage recommendations
-                if memory_percent > 95:
-                    recommendations.append(
-                        f"GPU {device_id}: Critical memory usage ({memory_percent:.1f}%) - "
-                        "reduce batch size or enable gradient checkpointing"
-                    )
-                elif memory_percent > 85:
-                    recommendations.append(
-                        f"GPU {device_id}: High memory usage ({memory_percent:.1f}%) - "
-                        "consider reducing batch size for stability"
-                    )
-                
-                # Temperature recommendations
-                temperature = gpu.get('temperature_c', 0)
-                if temperature > 85:
-                    recommendations.append(
-                        f"GPU {device_id}: High temperature ({temperature}°C) - "
-                        "check cooling and reduce workload if necessary"
-                    )
-            
-            # Multi-GPU recommendations
-            if len(gpu_devices) > 1:
-                utilizations = [gpu.get('utilization_percent', 0) for gpu in gpu_devices]
-                util_std = (sum((u - sum(utilizations)/len(utilizations))**2 for u in utilizations) / len(utilizations))**0.5
-                
-                if util_std > 20:
-                    recommendations.append(
-                        "Uneven GPU utilization detected - check data loading and model parallelization"
-                    )
-            
-            # System bottleneck recommendations
-            system = current_usage.get('system', {})
-            if system.get('cpu_percent', 0) > 90:
-                recommendations.append("High CPU usage - consider optimizing data preprocessing or using more workers")
-            
-            if system.get('memory_percent', 0) > 90:
-                recommendations.append("High system memory usage - reduce dataset size in memory or use data streaming")
-            
-            if not recommendations:
-                recommendations.append("GPU utilization looks optimal - no specific recommendations")
-            
-            return recommendations
-            
+                if mp > 95:
+                    recs.append(f"GPU {did}: memory critical ({mp:.1f}%). Enable gradient checkpointing or reduce batch size.")
+                elif mp > 85:
+                    recs.append(f"GPU {did}: memory high ({mp:.1f}%). Consider mixed precision or smaller activations.")
+                if isinstance(temp, (int, float)) and temp > 85:
+                    recs.append(f"GPU {did}: hot ({temp}°C). Improve cooling or reduce sustained load.")
+
+            if len(gpus) > 1:
+                utils = [float(m.get("utilization_percent", 0.0)) for m in gpus]
+                if utils:
+                    mean_u = sum(utils) / len(utils)
+                    var = sum((u - mean_u) ** 2 for u in utils) / len(utils)
+                    std = var ** 0.5
+                    if std > 20:
+                        recs.append("Uneven multi-GPU utilization. Check data sharding, DDP setup, and I/O bottlenecks.")
+
+            if float(sysm.get("cpu_percent", 0.0)) > 90.0:
+                recs.append("High CPU usage. Increase dataloader workers, enable pinned memory, or prefetch/cache datasets.")
+            if float(sysm.get("memory_percent", 0.0)) > 90.0:
+                recs.append("System RAM high. Stream data or reduce in-memory caching.")
+
+            if not recs:
+                recs.append("GPU utilization looks healthy — no immediate tuning needed.")
+            return recs
         except Exception as e:
-            print(f"❌ Failed to generate recommendations: {e}")
-            return ["Unable to generate recommendations due to error"]
-    
-    def export_monitoring_data(self, filepath: str, include_history: bool = True):
-        """
-        Export monitoring data to file
-        
-        Args:
-            filepath: Path to save the data
-            include_history: Whether to include full history or just summary
-        """
+            print(f"❌ Recommendations failed: {e}")
+            return ["Unable to generate recommendations due to an error."]
+
+    # ---------------------------
+    # Export
+    # ---------------------------
+    def export_monitoring_data(self, filepath: str, include_history: bool = True) -> None:
         try:
-            export_data = {
-                'export_timestamp': datetime.now().isoformat(),
-                'experiment_id': self.experiment_id,
-                'device_info': self.devices_info,
-                'monitoring_config': {
-                    'sampling_interval': self.sampling_interval,
-                    'history_size': self.history_size,
-                    'gpu_library': self.gpu_library
-                },
-                'performance_summary': self.get_performance_summary(),
-                'current_usage': self.get_current_usage(),
-                'recommendations': self.get_optimization_recommendations(),
-                'recent_alerts': [
-                    {
-                        'timestamp': alert['timestamp'].isoformat(),
-                        **{k: v for k, v in alert.items() if k != 'timestamp'}
-                    }
-                    for alert in self.alerts[-20:]  # Last 20 alerts
-                ]
-            }
-            
-            if include_history:
-                export_data['gpu_history'] = [
-                    {
-                        'timestamp': entry['timestamp'].isoformat(),
-                        'metrics': entry['metrics']
-                    }
-                    for entry in self.gpu_history
-                ]
-                export_data['system_history'] = [
-                    {
-                        'timestamp': entry['timestamp'].isoformat(),
-                        'metrics': entry['metrics']
-                    }
-                    for entry in self.system_history
-                ]
-            
-            with open(filepath, 'w') as f:
-                json.dump(export_data, f, indent=2)
-            
+            with self._lock:
+                export = {
+                    "export_timestamp": datetime.now().isoformat(),
+                    "experiment_id": self.experiment_id,
+                    "device_info": self.devices_info,
+                    "monitoring_config": {
+                        "sampling_interval": self.sampling_interval,
+                        "history_size": self.history_size,
+                        "gpu_library": self.gpu_library,
+                    },
+                    "performance_summary": self.get_performance_summary(),
+                    "current_usage": self.get_current_usage(),
+                    "recommendations": self.get_optimization_recommendations(),
+                    "recent_alerts": [
+                        {"timestamp": a["timestamp"].isoformat(), **{k: v for k, v in a.items() if k != "timestamp"}}
+                        for a in self.alerts[-20:]
+                    ],
+                }
+                if include_history:
+                    export["gpu_history"] = [
+                        {"timestamp": e["timestamp"].isoformat(), "metrics": e["metrics"]} for e in self.gpu_history
+                    ]
+                    export["system_history"] = [
+                        {"timestamp": e["timestamp"].isoformat(), "metrics": e["metrics"]} for e in self.system_history
+                    ]
+            with open(filepath, "w") as f:
+                json.dump(export, f, indent=2)
             print(f"📁 Exported monitoring data to: {filepath}")
-            
         except Exception as e:
             print(f"❌ Failed to export monitoring data: {e}")
-    
-    def cleanup(self):
-        """Clean up monitoring resources"""
+
+    # ---------------------------
+    # Cleanup / Context
+    # ---------------------------
+    def cleanup(self) -> None:
         self.stop_monitoring()
-        self.gpu_history.clear()
-        self.system_history.clear()
-        self.alerts.clear()
+        with self._lock:
+            self.gpu_history.clear()
+            self.system_history.clear()
+            self.alerts.clear()
         print("🧹 GPU monitor cleaned up")
-    
-    def __enter__(self):
-        """Context manager entry"""
+
+    def __enter__(self) -> "GPUMonitor":
         return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit"""
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.cleanup()

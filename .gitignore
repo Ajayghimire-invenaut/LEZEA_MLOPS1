@@ -1,0 +1,129 @@
+# ======================
+# OS & Editor Junk
+# ======================
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ======================
+# Python Build Artifacts
+# ======================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+*.manifest
+*.spec
+
+# ======================
+# Virtual Environments
+# ======================
+env/
+venv/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ======================
+# Jupyter Notebooks
+# ======================
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+# ======================
+# Logs & Outputs
+# ======================
+logs/
+*.log
+*.out
+*.err
+nohup.out
+
+# ======================
+# ML / DL Artifacts
+# ======================
+# Datasets
+data/
+datasets/
+# Model checkpoints
+checkpoints/
+*.ckpt
+*.pt
+*.pth
+*.h5
+*.joblib
+*.pkl
+*.onnx
+# TensorBoard
+runs/
+tb_logs/
+# HuggingFace cache
+.huggingface/
+# Transformers cache
+transformers_cache/
+# PyTorch Lightning
+lightning_logs/
+# Stable Diffusion / Diffusers
+diffusers_cache/
+# Ray / RLlib results
+ray_results/
+
+# ======================
+# MLOps Tools
+# ======================
+# MLflow
+mlruns/
+# DVC cache & outputs
+.dvc/
+.dvc/cache/
+.dvc/tmp/
+# MinIO local data
+minio_data/
+# Prometheus DB
+prometheus_data/
+# Grafana data
+grafana_data/
+
+# ======================
+# Config & Secrets
+# ======================
+.env
+.env.*
+!env.example
+*.secret
+*.key
+*.pem
+*.crt
+
+# ======================
+# Docker
+# ======================
+docker-compose.override.yml
+.docker/
+.dockerignore
+*~docker*
+**/docker-volume/
+
+# ======================
+# Temporary / Scratch
+# ======================
+tmp/
+temp/
+scratch/
