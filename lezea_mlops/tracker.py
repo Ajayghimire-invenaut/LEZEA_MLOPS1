@@ -1,24 +1,4 @@
-"""
-LeZeA MLOps Experiment Tracker — FINAL
-=====================================
-
-Spec coverage (concise):
-- Experiment metadata (IDs, names, purpose, timestamps)
-- Environment capture (hardware/firmware when available, software, git)
-- Constraints (runtime, steps, episodes)
-- LeZeA config (pop sizes, algo, starting nets, seeds, hparams, init scheme)
-- Per-epoch/step metrics with scoping (builder/tasker/algorithm/network/layer)
-- Delta metrics (e.g., delta_loss)
-- Modification trees + stats (numeric stats → metrics; full tree via Mongo/artifacts)
-- Data splits + dataset version (via DVC if available; fallback marker)
-- Resource usage summaries (per-scope + overall) + optional cost model hooks
-- Checkpoints + final models
-- Results (tasker/builder rewards, RL episodes, classification metrics, generation outputs) + summary
-- Business metrics (manual cost/comments/conclusion)
-- Data-usage rate & learning relevance attribution
-
-Backends degrade gracefully if unavailable.
-"""
+# lezea_mlops/tracker.py
 
 from __future__ import annotations
 
@@ -27,17 +7,16 @@ import json
 import time
 import uuid
 import traceback
+import hashlib
+import random
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from contextlib import contextmanager
 from collections import defaultdict, Counter
-
-# Optional Prometheus HTTP exporter
-try:
-    from prometheus_client import start_http_server as _prom_start
-except Exception:  # pragma: no cover
-    _prom_start = None  # type: ignore
+from threading import Thread, Event
+from queue import Queue, Empty
+import tempfile
 
 # Config
 from .config import config
@@ -68,6 +47,17 @@ except Exception:  # cost model optional
     CostModel = None  # type: ignore
 
 
+# ---------------------------
+# Helpers
+# ---------------------------
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 class ExperimentTracker:
     """Unified tracker for LeZeA experiments (spec-aligned)."""
 
@@ -80,7 +70,16 @@ class ExperimentTracker:
         purpose: str = "",
         tags: Optional[Dict[str, str]] = None,
         auto_start: bool = False,
+        *,
+        async_mode: bool = False,
+        strict_default: bool = False,
+        local_fallback_dir: str = "artifacts/local",
     ) -> None:
+        """
+        async_mode: queue backend writes off the hot path (best for training loops)
+        strict_default: default behavior for start(strict=...) if not provided
+        local_fallback_dir: where to dump JSON artifacts if all backends are down
+        """
         validate_experiment_name(experiment_name)
 
         # Core metadata
@@ -112,12 +111,14 @@ class ExperimentTracker:
         self.training_steps: int = 0
         self.checkpoints_saved: int = 0
         self.total_cost: float = 0.0  # manual business cost; auto-cost uses CostModel if available
+        self.strict_default = strict_default
 
         self._step_times: List[float] = []
         self._resource_warnings: List[str] = []
         self._last_loss: Optional[float] = None
         self._scope_stack: List[Dict[str, str]] = []  # each: {level, entity_id}
         self._resource_accum: Dict[str, Dict[str, float]] = {}  # key: scope_key -> metrics
+        self._stop_signaled: bool = False  # constraint signal once
 
         # Results accumulators (compact running aggregates per scope_key)
         self._tasker_rewards_sum: Dict[str, Counter] = defaultdict(Counter)
@@ -140,13 +141,88 @@ class ExperimentTracker:
         # Data usage / learning relevance (optional)
         self.data_usage = DataUsageLogger() if DataUsageLogger else None  # type: ignore
 
+        # Async plumbing
+        self.async_mode = bool(async_mode)
+        self.local_fallback_dir = local_fallback_dir
+        self._q: Queue[Tuple[str, str, tuple, dict]] = Queue()
+        self._stop_evt: Event = Event()
+        self._worker: Optional[Thread] = None
+
         print("🚀 LeZeA MLOps Tracker Ready")
         print(f"   Experiment: {experiment_name}")
         print(f"   ID: {self.experiment_id[:8]}...")
         print(f"   Purpose: {purpose}")
+        if self.async_mode:
+            print("   Mode: async (non-blocking logging)")
 
         if auto_start:
             self.start()
+
+    # ---------------------------
+    # Backend call helpers (retry + optional async)
+    # ---------------------------
+    def _exec_with_retry(self, backend_name: str, method: str, *args, **kwargs):
+        backend = self.backends.get(backend_name)
+        if backend is None:
+            raise RuntimeError(f"backend '{backend_name}' unavailable")
+        attempts = 3
+        delay = 0.2
+        for i in range(attempts):
+            try:
+                return getattr(backend, method)(*args, **kwargs)
+            except Exception as e:
+                if i == attempts - 1:
+                    raise
+                self.logger.warning(
+                    f"Retry {i+1}/{attempts-1} {backend_name}.{method} failed: {e}"
+                )
+                time.sleep(delay + random.random() * delay)
+                delay *= 2
+
+    def _submit(self, backend_name: str, method: str, *args, async_ok: bool = True, **kwargs):
+        """Queue or execute a backend call."""
+        if self.async_mode and async_ok:
+            self._q.put((backend_name, method, args, kwargs))
+            return None
+        return self._exec_with_retry(backend_name, method, *args, **kwargs)
+
+    def _drain(self):
+        while not self._stop_evt.is_set() or not self._q.empty():
+            try:
+                backend_name, method, args, kwargs = self._q.get(timeout=0.2)
+            except Empty:
+                continue
+            try:
+                self._exec_with_retry(backend_name, method, *args, **kwargs)
+            except Exception as e:
+                # Best-effort fallback for dict-like payloads
+                payload = kwargs.get("payload") or (args[0] if args else None)
+                if isinstance(payload, dict) and method in {"log_dict"}:
+                    rel = kwargs.get("artifact_file") or "failed_async.json"
+                    self._fallback_write(rel, payload)
+                self.logger.warning(f"Async call dropped {backend_name}.{method}: {e}")
+
+    def _start_async_worker(self):
+        if self.async_mode and self._worker is None:
+            self._worker = Thread(target=self._drain, daemon=True)
+            self._worker.start()
+
+    def _stop_async_worker(self):
+        if self._worker:
+            self._stop_evt.set()
+            self._worker.join(timeout=5)
+            self._worker = None
+            self._stop_evt.clear()
+
+    def _fallback_write(self, rel_path: str, obj: Dict[str, Any]) -> None:
+        try:
+            base = Path(self.local_fallback_dir) / self.experiment_id
+            p = base / rel_path
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "w") as f:
+                json.dump(obj, f, indent=2)
+        except Exception:
+            pass
 
     # ---------------------------
     # Init helpers
@@ -187,25 +263,31 @@ class ExperimentTracker:
     # ---------------------------
     # Start / End
     # ---------------------------
-    def start(self, *, prom_port: Optional[int] = 8000, strict: bool = False) -> "ExperimentTracker":
+    def start(self, *, prom_port: Optional[int] = 8000, strict: Optional[bool] = None) -> "ExperimentTracker":
         """Start a run. If strict=True, fail when critical backends are down."""
         if self.is_active:
             self.logger.warning("Experiment already active")
             print("⚠️ Experiment already active")
             return self
+        strict = self.strict_default if strict is None else bool(strict)
         try:
             # MLflow experiment + run
             if self.backends.get("mlflow"):
-                self.backends["mlflow"].create_experiment(self.experiment_name, self.experiment_id)
-                self.backends["mlflow"].start_run(
-                    f"{self.experiment_name}_{self.experiment_id[:8]}", tags=self.tags
+                self._exec_with_retry("mlflow", "create_experiment", self.experiment_name, self.experiment_id)
+                self._exec_with_retry(
+                    "mlflow",
+                    "start_run",
+                    f"{self.experiment_name}_{self.experiment_id[:8]}",
+                    tags=self.tags,
                 )
                 self._log_experiment_metadata()
                 self._log_environment()
 
             # Mongo: experiment record
             if self.backends.get("mongodb"):
-                self.backends["mongodb"].store_experiment_metadata(
+                self._exec_with_retry(
+                    "mongodb",
+                    "store_experiment_metadata",
                     self.experiment_id,
                     {
                         "name": self.experiment_name,
@@ -216,20 +298,9 @@ class ExperimentTracker:
                     },
                 )
 
-            # Start Prometheus exporter (if requested and library present)
-            if prom_port and _prom_start:
-                try:
-                    _prom_start(prom_port)
-                    self.logger.info(f"Prometheus metrics on :{prom_port}")
-                    print(f"📡 Prometheus metrics on :{prom_port}")
-                except Exception as e:
-                    self.logger.warning(f"Prometheus exporter not started: {e}")
-                    if strict:
-                        raise
-
-            # Start GPU monitor if present
+            # Start GPU monitor (and its Prometheus exporter) if present
             if self.gpu_monitor:
-                self.gpu_monitor.start_monitoring(self.experiment_id)
+                self.gpu_monitor.start_monitoring(self.experiment_id, prometheus_port=prom_port)
 
             # Health check (soft or strict)
             ok = self._health_check()
@@ -237,6 +308,7 @@ class ExperimentTracker:
                 raise RuntimeError("Backend health check failed")
 
             self.is_active = True
+            self._start_async_worker()
             print(f"🎯 Started experiment: {self.experiment_name}")
             return self
         except Exception as e:  # pragma: no cover — defensive
@@ -264,27 +336,62 @@ class ExperimentTracker:
             # Persist final results summary (per scope)
             _ = self._finalize_results_summary(log_to_backends=True)
 
-            # Persist data-usage summary
+            # Persist data-usage summary + full-state artifact
             if self.data_usage:
                 try:
                     summary = self.data_usage.summary()
                     if self.backends.get("mlflow"):
-                        self.backends["mlflow"].log_dict(summary, "data_usage/summary.json")
+                        # compact summary
+                        self._submit("mlflow", "log_dict", summary, artifact_file="data_usage/summary.json")
+
+                        # full state export as an artifact
+                        with tempfile.TemporaryDirectory() as tmp:
+                            dump_path = os.path.join(tmp, "data_usage_state.json")
+                            try:
+                                # `export_json` exists in the updated DataUsageLogger
+                                self.data_usage.export_json(dump_path)
+                            except Exception:
+                                # Fallback to embedding the internal state if export_json is unavailable
+                                payload = {
+                                    "state": {
+                                        "split_totals": self.data_usage.split_totals,
+                                        "seen_ids": {k: list(v) for k, v in self.data_usage.seen_ids.items()},
+                                        "exposures": dict(self.data_usage.exposures),
+                                        "relevance": {k: dict(v) for k, v in self.data_usage.relevance.items()},
+                                    },
+                                    "summary": summary,
+                                    "exported_at": datetime.now().isoformat(),
+                                }
+                                with open(dump_path, "w") as f:
+                                    json.dump(payload, f, indent=2)
+                            self._submit("mlflow", "log_artifact", dump_path, artifact_path="data_usage")
+
                     if self.backends.get("mongodb"):
-                        self.backends["mongodb"].store_results(
-                            self.experiment_id, {"kind": "data_usage_summary", **summary}
+                        self._submit("mongodb", "store_results", self.experiment_id, {"kind": "data_usage_summary", **summary})
+                        self._submit(
+                            "mongodb",
+                            "store_results",
+                            self.experiment_id,
+                            {
+                                "kind": "data_usage_state_meta",
+                                "artifact_hint": "mlflow: data_usage/data_usage_state.json",
+                                "timestamp": datetime.now().isoformat(),
+                            },
                         )
                 except Exception:
                     pass
 
             # Persist cost summary (if model available)
             if self.cost:
-                cost_summary = self.cost.summary()
+                try:
+                    cost_summary = self.cost.summary()
+                except Exception:
+                    cost_summary = {}
                 if self.backends.get("mlflow"):
-                    self.backends["mlflow"].log_dict(cost_summary, "business/cost_summary.json")
+                    self._submit("mlflow", "log_dict", cost_summary, artifact_file="business/cost_summary.json")
                 if self.backends.get("mongodb"):
                     try:
-                        self.backends["mongodb"].store_business_metrics(self.experiment_id, {"cost_model": cost_summary})
+                        self._submit("mongodb", "store_business_metrics", self.experiment_id, {"cost_model": cost_summary})
                     except Exception:
                         pass
                 try:
@@ -309,17 +416,20 @@ class ExperimentTracker:
                     for k, v in vals.items():
                         if isinstance(v, (int, float)):
                             numeric_flat[f"resource/{scope_key}/{k}"] = v
-                numeric_flat.update({
-                    k: v for k, v in res_summary.items() if isinstance(v, (int, float))
-                })
-                final_metrics.update(numeric_flat)
-                self.backends["mlflow"].log_metrics(final_metrics)
-                self.backends["mlflow"].log_dict(res_summary, "resources/summary.json")
-                self.backends["mlflow"].end_run()
+                numeric_flat.update({k: v for k, v in res_summary.items() if isinstance(v, (int, float))})
+                self._submit("mlflow", "log_metrics", numeric_flat, step=None)
+                self._submit("mlflow", "log_dict", res_summary, artifact_file="resources/summary.json")
+                try:
+                    self._exec_with_retry("mlflow", "end_run")
+                except Exception:
+                    pass
 
             # Store summary in Mongo
             if self.backends.get("mongodb"):
-                self.backends["mongodb"].store_experiment_summary(self.experiment_id, self.get_experiment_summary())
+                self._submit("mongodb", "store_experiment_summary", self.experiment_id, self.get_experiment_summary())
+
+            # Stop async worker AFTER queuing all submissions
+            self._stop_async_worker()
 
             self.is_active = False
             print("🏁 Experiment completed!")
@@ -415,16 +525,16 @@ class ExperimentTracker:
                     params.update({f"hp_{k}": v for k, v in hyperparameters.items()})
                 if seeds:
                     params.update({f"seed_{k}": v for k, v in seeds.items()})
-                self.backends["mlflow"].log_params(params)
+                self._submit("mlflow", "log_params", params, async_ok=False)  # params are small; do synchronously
             if self.backends.get("mongodb"):
-                self.backends["mongodb"].store_lezea_config(self.experiment_id, self.lezea_config)
+                self._submit("mongodb", "store_lezea_config", self.experiment_id, self.lezea_config)
             print(f"📝 Logged LeZeA config: {tasker_pop_size} taskers, {builder_pop_size} builders")
         except Exception as e:  # pragma: no cover — defensive
             self.logger.error(f"Failed to log LeZeA config: {e}")
             print(f"❌ Failed to log LeZeA config: {e}")
 
     # ---------------------------
-    # Spec: 1.3 Constraints
+    # Spec: 1.3 Constraints (+ enforcement)
     # ---------------------------
     def log_constraints(
         self,
@@ -442,15 +552,28 @@ class ExperimentTracker:
             "timestamp": datetime.now().isoformat(),
         }
         try:
-            params: Dict[str, Any] = {}
             if self.backends.get("mlflow"):
                 params = {k: v for k, v in self.constraints.items() if v is not None and k != "timestamp"}
                 if params:
-                    self.backends["mlflow"].log_params(params)
-            print(f"⏱️ Logged constraints: {params if params else '{}'}")
+                    self._submit("mlflow", "log_params", params, async_ok=False)
+            print(f"⏱️ Logged constraints: { {k:v for k,v in self.constraints.items() if v is not None} }")
         except Exception as e:  # pragma: no cover — defensive
             self.logger.error(f"Failed to log constraints: {e}")
             print(f"❌ Failed to log constraints: {e}")
+
+    def should_stop(self, *, episodes_so_far: Optional[int] = None) -> bool:
+        """Return True if any constraint has been reached/exceeded."""
+        now = datetime.now()
+        if self.constraints.get("max_runtime_seconds"):
+            if (now - self.start_time).total_seconds() >= float(self.constraints["max_runtime_seconds"]):
+                return True
+        if self.constraints.get("max_steps") is not None:
+            if self.training_steps >= int(self.constraints["max_steps"]):
+                return True
+        if self.constraints.get("max_episodes") is not None and episodes_so_far is not None:
+            if int(episodes_so_far) >= int(self.constraints["max_episodes"]):
+                return True
+        return False
 
     # ---------------------------
     # Scoping helpers
@@ -479,7 +602,7 @@ class ExperimentTracker:
         try:
             if self.backends.get("mlflow"):
                 try:
-                    self.backends["mlflow"].set_tags({"scope_level": level, "scope_entity": entity_id, **(extra_tags or {})})
+                    self._submit("mlflow", "set_tags", {"scope_level": level, "scope_entity": entity_id, **(extra_tags or {})}, async_ok=False)
                 except Exception:
                     pass
             yield
@@ -513,18 +636,56 @@ class ExperimentTracker:
             # Data-usage & learning relevance (optional)
             if self.data_usage and sample_ids and split:
                 try:
+                    # update + collect metrics
                     self.data_usage.update(sample_ids, split, delta_loss=validated.get("delta_loss"))
                     usage_metrics = self.data_usage.get_split_metrics(split)
+                    dist_metrics = self.data_usage.distribution_stats(split)
+                    rates = self.data_usage.rates()
+
+                    # MLflow: per-split usage + distribution metrics
                     if self.backends.get("mlflow"):
                         prefixed_usage = self._prefix_metrics({f"data/usage/{split}/{k}": v for k, v in usage_metrics.items()})
+                        prefixed_dist = self._prefix_metrics({f"data/usage/{split}/dist_{k}": v for k, v in dist_metrics.items()})
+                        # also log global rates across splits (small count)
+                        prefixed_rates = self._prefix_metrics({f"data/usage/rates/{k}": v for k, v in rates.items()})
                         self.backends["mlflow"].log_metrics(prefixed_usage, step=step)
-                    # Occasionally persist top-k attribution
-                    if self.backends.get("mlflow") and (step % 200 == 0 or step < 10):
+                        self.backends["mlflow"].log_metrics(prefixed_dist, step=step)
+                        if prefixed_rates:
+                            self.backends["mlflow"].log_metrics(prefixed_rates, step=step)
+
+                    # Push to Prometheus exporter (GPU monitor) for Grafana
+                    if self.gpu_monitor and hasattr(self.gpu_monitor, "update_data_usage_metrics"):
+                        try:
+                            self.gpu_monitor.update_data_usage_metrics(
+                                split,
+                                usage_metrics.get("usage_rate"),
+                                dist_metrics.get("gini"),
+                            )
+                        except Exception:
+                            pass
+
+                    # Periodic snapshot (MLflow artifact + Mongo)
+                    if (step % 200 == 0) or (step < 10):
                         topk = self.data_usage.top_k(split, k=25)
-                        self.backends["mlflow"].log_dict(
-                            {"split": split, "step": step, "top_relevant": topk},
-                            f"data_usage/{split}_top_relevant_step_{step}.json"
-                        )
+                        snapshot = {
+                            "split": split,
+                            "step": step,
+                            "usage": usage_metrics,
+                            "distribution": dist_metrics,
+                            "rates": rates,
+                            "top_relevant": topk,
+                            "timestamp": datetime.now().isoformat(),
+                            "scope": self._current_scope() or {"level": "global", "entity_id": "-"},
+                        }
+                        if self.backends.get("mlflow"):
+                            self.backends["mlflow"].log_dict(snapshot, f"data_usage/snapshots/{split}_snapshot_{step}.json")
+                        if self.backends.get("mongodb"):
+                            try:
+                                self.backends["mongodb"].store_results(
+                                    self.experiment_id, {"kind": "data_usage_snapshot", **snapshot}
+                                )
+                            except Exception:
+                                pass
                 except Exception:
                     pass
 
@@ -538,11 +699,11 @@ class ExperimentTracker:
             prefixed = self._prefix_metrics(validated)
 
             if self.backends.get("mlflow"):
-                self.backends["mlflow"].log_metrics(prefixed, step=step)
+                self._submit("mlflow", "log_metrics", prefixed, step=step)
                 if episode is not None:
                     ep_key = self._prefix_metrics({"episode": episode})
                     k = list(ep_key.keys())[0]
-                    self.backends["mlflow"].log_metric(k, episode, step=step)
+                    self._submit("mlflow", "log_metric", k, episode, step=step)
 
             if self.backends.get("mongodb"):
                 doc = {
@@ -557,13 +718,27 @@ class ExperimentTracker:
                         "batch_count": len(sample_ids) if sample_ids else 0,
                     } if split else None,
                 }
-                self.backends["mongodb"].store_training_step(self.experiment_id, doc)
+                self._submit("mongodb", "store_training_step", self.experiment_id, doc)
 
             # Resource + optional cost sampling
             usage = self._sample_resource_usage()
             self._update_cost_model(validated.get("step_duration_seconds"), usage)
 
             self._check_performance_warnings(step, validated)
+
+            # Soft enforcement signal
+            if self.should_stop():
+                if not self._stop_signaled:
+                    self._stop_signaled = True
+                    if self.backends.get("mlflow"):
+                        self._submit("mlflow", "set_tags", {"stop_signal": "constraints_reached"}, async_ok=False)
+                    if self.backends.get("mongodb"):
+                        self._submit(
+                            "mongodb",
+                            "store_results",
+                            self.experiment_id,
+                            {"kind": "stop_signal", "reason": "constraints_reached", "at_step": step, "timestamp": datetime.now().isoformat()},
+                        )
 
             if step % 100 == 0 or step < 10:
                 msg = ", ".join(
@@ -589,13 +764,13 @@ class ExperimentTracker:
                 "scope": self._current_scope() or {"level": "global", "entity_id": "-"},
             }
             if self.backends.get("mongodb"):
-                self.backends["mongodb"].store_modification_tree(self.experiment_id, payload)
+                self._submit("mongodb", "store_modification_tree", self.experiment_id, payload)
             if self.backends.get("mlflow") and statistics:
                 numeric = {f"mod_{k}": v for k, v in statistics.items() if isinstance(v, (int, float))}
                 if numeric:
-                    self.backends["mlflow"].log_metrics(self._prefix_metrics(numeric), step=step)
+                    self._submit("mlflow", "log_metrics", self._prefix_metrics(numeric), step=step)
             if self.backends.get("mlflow"):
-                self.backends["mlflow"].log_dict(payload, f"modifications/step_{step}.json")
+                self._submit("mlflow", "log_dict", payload, artifact_file=f"modifications/step_{step}.json")
             print(f"🌳 Logged modification tree: {len(modifications)} changes at step {step}")
         except Exception as e:  # pragma: no cover
             self.logger.error(f"Failed to log modification tree: {e}")
@@ -610,10 +785,10 @@ class ExperimentTracker:
         info = {"train": train, "val": val, "test": test, **(extra or {})}
         try:
             if self.backends.get("mlflow"):
-                self.backends["mlflow"].log_params({"split_train": train, "split_val": val, "split_test": test})
-                self.backends["mlflow"].log_dict(info, "data_splits.json")
+                self._submit("mlflow", "log_params", {"split_train": train, "split_val": val, "split_test": test}, async_ok=False)
+                self._submit("mlflow", "log_dict", info, artifact_file="data_splits.json")
             if self.backends.get("mongodb"):
-                self.backends["mongodb"].store_data_splits(self.experiment_id, info)
+                self._submit("mongodb", "store_data_splits", self.experiment_id, info)
             # Feed totals to data-usage logger if enabled
             if self.data_usage:
                 try:
@@ -624,8 +799,15 @@ class ExperimentTracker:
         except Exception as e:
             self.logger.error(f"Failed to log data splits: {e}")
 
-    def log_dataset_version(self, dataset_name: str, dataset_root: str = "data/") -> Optional[Dict[str, Any]]:
-        """Record dataset version using DVC if available; otherwise create a basic marker."""
+    def log_dataset_version(
+        self,
+        dataset_name: str,
+        dataset_root: str = "data/",
+        *,
+        preprocess_code_path: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Record dataset version using DVC if available; otherwise create a basic marker.
+        Also records optional preprocess code hash for lineage."""
         try:
             version_info: Optional[Dict[str, Any]] = None
             dvc = self.backends.get("dvc")
@@ -634,11 +816,14 @@ class ExperimentTracker:
             else:
                 version_info = {"name": dataset_name, "root": dataset_root, "version_tag": "manual"}
 
+            if preprocess_code_path and os.path.exists(preprocess_code_path):
+                version_info["preprocess_hash"] = _sha256_file(preprocess_code_path)
+
             if self.backends.get("mlflow") and version_info:
-                self.backends["mlflow"].log_params({f"dataset_{dataset_name}_version": version_info.get("version_tag", "unknown")})
-                self.backends["mlflow"].log_dict(version_info, f"datasets/{dataset_name}_version.json")
+                self._submit("mlflow", "log_params", {f"dataset_{dataset_name}_version": version_info.get("version_tag", "unknown")}, async_ok=False)
+                self._submit("mlflow", "log_dict", version_info, artifact_file=f"datasets/{dataset_name}_version.json")
             if self.backends.get("mongodb") and version_info:
-                self.backends["mongodb"].store_dataset_version(self.experiment_id, dataset_name, version_info)
+                self._submit("mongodb", "store_dataset_version", self.experiment_id, dataset_name, version_info)
             print(f"📦 Logged dataset version for {dataset_name}")
             return version_info
         except Exception as e:  # pragma: no cover
@@ -712,14 +897,41 @@ class ExperimentTracker:
             print(f"❌ Checkpoint file not found: {checkpoint_path}")
             return
         try:
+            # Integrity + metadata
+            meta = {
+                "sha256": _sha256_file(checkpoint_path),
+                "filesize": os.path.getsize(checkpoint_path),
+                "created_at": datetime.now().isoformat(),
+                "role": role,
+                "scope_key": self._scope_key(),
+            }
+            if metadata:
+                meta.update(metadata)
+
+            # Upload to S3 (if configured)
             s3_key = None
             if self.backends.get("s3"):
-                s3_key = self.backends["s3"].upload_checkpoint(checkpoint_path, self.experiment_id, step, {"role": role, **(metadata or {})})
+                s3_key = self._exec_with_retry(
+                    "s3",
+                    "upload_checkpoint",
+                    checkpoint_path,
+                    self.experiment_id,
+                    step,
+                    meta,
+                )
+                meta["s3_key"] = s3_key
+
+            # Log in MLflow (artifact + meta json + metric)
             if self.backends.get("mlflow"):
-                self.backends["mlflow"].log_artifact(checkpoint_path)
+                self._submit("mlflow", "log_artifact", checkpoint_path, async_ok=False)
+                self._submit("mlflow", "log_dict", meta, artifact_file=f"checkpoints/{Path(checkpoint_path).name}.meta.json")
                 if step is not None:
                     k = list(self._prefix_metrics({f"{role}_checkpoint_step": step}).keys())[0]
-                    self.backends["mlflow"].log_metric(k, step, step=step)
+                    self._submit("mlflow", "log_metric", k, step, step=step)
+
+            # Minimal local fallback (meta only)
+            self._fallback_write(f"checkpoints/{Path(checkpoint_path).name}.meta.local.json", meta)
+
             self.checkpoints_saved += 1
             print(f"💾 Logged checkpoint: {Path(checkpoint_path).name} ({role}) -> S3: {s3_key}")
         except Exception as e:  # pragma: no cover
@@ -732,10 +944,26 @@ class ExperimentTracker:
         try:
             logged = []
             if tasker_model_path and os.path.exists(tasker_model_path) and self.backends.get("s3"):
-                s3_key = self.backends["s3"].upload_final_model(tasker_model_path, self.experiment_id, "tasker", f"final_tasker_{self.experiment_id[:8]}", metadata)
+                s3_key = self._exec_with_retry(
+                    "s3",
+                    "upload_final_model",
+                    tasker_model_path,
+                    self.experiment_id,
+                    "tasker",
+                    f"final_tasker_{self.experiment_id[:8]}",
+                    metadata,
+                )
                 logged.append(f"tasker -> {s3_key}")
             if builder_model_path and os.path.exists(builder_model_path) and self.backends.get("s3"):
-                s3_key = self.backends["s3"].upload_final_model(builder_model_path, self.experiment_id, "builder", f"final_builder_{self.experiment_id[:8]}", metadata)
+                s3_key = self._exec_with_retry(
+                    "s3",
+                    "upload_final_model",
+                    builder_model_path,
+                    self.experiment_id,
+                    "builder",
+                    f"final_builder_{self.experiment_id[:8]}",
+                    metadata,
+                )
                 logged.append(f"builder -> {s3_key}")
             if logged:
                 print(f"🏆 Logged final models: {', '.join(logged)}")
@@ -755,11 +983,11 @@ class ExperimentTracker:
             if isinstance(v, (int, float)):
                 self._tasker_rewards_sum[sk][k] += float(v)
         if self.backends.get("mlflow") and rewards:
-            self.backends["mlflow"].log_metrics(self._prefix_metrics({f"tasker_reward/{k}": v for k, v in rewards.items()}), step=step or 0)
-            self.backends["mlflow"].log_dict({"rewards": rewards, "scope": scope, "step": step}, f"results/tasker_rewards_{step or 'na'}.json")
+            self._submit("mlflow", "log_metrics", self._prefix_metrics({f"tasker_reward/{k}": v for k, v in rewards.items()}), step=step or 0)
+            self._submit("mlflow", "log_dict", {"rewards": rewards, "scope": scope, "step": step}, artifact_file=f"results/tasker_rewards_{step or 'na'}.json")
         if self.backends.get("mongodb"):
             try:
-                self.backends["mongodb"].store_results(self.experiment_id, {"kind": "tasker_rewards", "rewards": rewards, "scope": scope, "step": step, "timestamp": datetime.now().isoformat()})
+                self._submit("mongodb", "store_results", self.experiment_id, {"kind": "tasker_rewards", "rewards": rewards, "scope": scope, "step": step, "timestamp": datetime.now().isoformat()})
             except Exception:
                 pass
 
@@ -772,11 +1000,11 @@ class ExperimentTracker:
             if isinstance(v, (int, float)):
                 self._builder_rewards_sum[sk][k] += float(v)
         if self.backends.get("mlflow") and rewards:
-            self.backends["mlflow"].log_metrics(self._prefix_metrics({f"builder_reward/{k}": v for k, v in rewards.items()}), step=step or 0)
-            self.backends["mlflow"].log_dict({"rewards": rewards, "scope": scope, "step": step}, f"results/builder_rewards_{step or 'na'}.json")
+            self._submit("mlflow", "log_metrics", self._prefix_metrics({f"builder_reward/{k}": v for k, v in rewards.items()}), step=step or 0)
+            self._submit("mlflow", "log_dict", {"rewards": rewards, "scope": scope, "step": step}, artifact_file=f"results/builder_rewards_{step or 'na'}.json")
         if self.backends.get("mongodb"):
             try:
-                self.backends["mongodb"].store_results(self.experiment_id, {"kind": "builder_rewards", "rewards": rewards, "scope": scope, "step": step, "timestamp": datetime.now().isoformat()})
+                self._submit("mongodb", "store_results", self.experiment_id, {"kind": "builder_rewards", "rewards": rewards, "scope": scope, "step": step, "timestamp": datetime.now().isoformat()})
             except Exception:
                 pass
 
@@ -797,11 +1025,11 @@ class ExperimentTracker:
         for a, cnt in (action_dist or {}).items():
             metrics[f"actions/{a}"] = float(cnt)
         if self.backends.get("mlflow"):
-            self.backends["mlflow"].log_metrics(self._prefix_metrics({f"rl/{k}": v for k, v in metrics.items()}), step=step or episode)
-            self.backends["mlflow"].log_dict({"episode": episode, "total_reward": total_reward, "steps": steps, "action_dist": action_dist or {}, "scope": scope}, f"results/rl_episode_{episode}.json")
+            self._submit("mlflow", "log_metrics", self._prefix_metrics({f"rl/{k}": v for k, v in metrics.items()}), step=step or episode)
+            self._submit("mlflow", "log_dict", {"episode": episode, "total_reward": total_reward, "steps": steps, "action_dist": action_dist or {}, "scope": scope}, artifact_file=f"results/rl_episode_{episode}.json")
         if self.backends.get("mongodb"):
             try:
-                self.backends["mongodb"].store_results(self.experiment_id, {"kind": "rl_episode", "episode": episode, "total_reward": total_reward, "steps": steps, "action_dist": action_dist or {}, "scope": scope, "timestamp": datetime.now().isoformat()})
+                self._submit("mongodb", "store_results", self.experiment_id, {"kind": "rl_episode", "episode": episode, "total_reward": total_reward, "steps": steps, "action_dist": action_dist or {}, "scope": scope, "timestamp": datetime.now().isoformat()})
             except Exception:
                 pass
 
@@ -854,11 +1082,11 @@ class ExperimentTracker:
         # log
         if self.backends.get("mlflow"):
             base = f"cls/{split}/"
-            self.backends["mlflow"].log_metrics(self._prefix_metrics({f"{base}accuracy": acc, f"{base}macro_precision": macro_p, f"{base}macro_recall": macro_r, f"{base}macro_f1": macro_f1}), step=step or 0)
-            self.backends["mlflow"].log_dict({"split": split, "labels": label_set, "accuracy": acc, "macro_precision": macro_p, "macro_recall": macro_r, "macro_f1": macro_f1, "confusion": conf, "scope": scope, "step": step}, f"results/classification_{split}_{step or 'na'}.json")
+            self._submit("mlflow", "log_metrics", self._prefix_metrics({f"{base}accuracy": acc, f"{base}macro_precision": macro_p, f"{base}macro_recall": macro_r, f"{base}macro_f1": macro_f1}), step=step or 0)
+            self._submit("mlflow", "log_dict", {"split": split, "labels": label_set, "accuracy": acc, "macro_precision": macro_p, "macro_recall": macro_r, "macro_f1": macro_f1, "confusion": conf, "scope": scope, "step": step}, artifact_file=f"results/classification_{split}_{step or 'na'}.json")
         if self.backends.get("mongodb"):
             try:
-                self.backends["mongodb"].store_results(self.experiment_id, {"kind": "classification", "split": split, "accuracy": acc, "macro_precision": macro_p, "macro_recall": macro_r, "macro_f1": macro_f1, "confusion": conf, "scope": scope, "timestamp": datetime.now().isoformat()})
+                self._submit("mongodb", "store_results", self.experiment_id, {"kind": "classification", "split": split, "accuracy": acc, "macro_precision": macro_p, "macro_recall": macro_r, "macro_f1": macro_f1, "confusion": conf, "scope": scope, "timestamp": datetime.now().isoformat()})
             except Exception:
                 pass
         return {"accuracy": acc, "macro_precision": macro_p, "macro_recall": macro_r, "macro_f1": macro_f1, "confusion": conf, "labels": label_set}
@@ -874,11 +1102,11 @@ class ExperimentTracker:
             self._gen_score_sum[sk] += avg_score * len(items)  # weight by count for running mean
         if self.backends.get("mlflow"):
             if avg_score is not None:
-                self.backends["mlflow"].log_metrics(self._prefix_metrics({f"gen/{name}/avg_score": float(avg_score)}), step=step or 0)
-            self.backends["mlflow"].log_dict({"name": name, "items": items, "avg_score": avg_score, "count": len(items), "scope": scope, "step": step}, f"results/generation_{name}_{step or 'na'}.json")
+                self._submit("mlflow", "log_metrics", self._prefix_metrics({f"gen/{name}/avg_score": float(avg_score)}), step=step or 0)
+            self._submit("mlflow", "log_dict", {"name": name, "items": items, "avg_score": avg_score, "count": len(items), "scope": scope, "step": step}, artifact_file=f"results/generation_{name}_{step or 'na'}.json")
         if self.backends.get("mongodb"):
             try:
-                self.backends["mongodb"].store_results(self.experiment_id, {"kind": "generation", "name": name, "count": len(items), "avg_score": avg_score, "scope": scope, "timestamp": datetime.now().isoformat()})
+                self._submit("mongodb", "store_results", self.experiment_id, {"kind": "generation", "name": name, "count": len(items), "avg_score": avg_score, "scope": scope, "timestamp": datetime.now().isoformat()})
             except Exception:
                 pass
         return {"avg_score": avg_score, "count": len(items)}
@@ -896,10 +1124,10 @@ class ExperimentTracker:
         if builder_rewards:
             self.log_builder_rewards(builder_rewards, step=step)
         if actions_outputs and self.backends.get("mlflow"):
-            self.backends["mlflow"].log_dict(actions_outputs, f"results/actions_outputs_{step or 'na'}.json")
+            self._submit("mlflow", "log_dict", actions_outputs, artifact_file=f"results/actions_outputs_{step or 'na'}.json")
         if actions_outputs and self.backends.get("mongodb"):
             try:
-                self.backends["mongodb"].store_results(self.experiment_id, {"kind": "actions_outputs", "payload": actions_outputs, "scope": self._current_scope() or {"level": "global", "entity_id": "-"}, "timestamp": datetime.now().isoformat(), "step": step})
+                self._submit("mongodb", "store_results", self.experiment_id, {"kind": "actions_outputs", "payload": actions_outputs, "scope": self._current_scope() or {"level": "global", "entity_id": "-"}, "timestamp": datetime.now().isoformat(), "step": step})
             except Exception:
                 pass
         print("✅ Logged results")
@@ -918,11 +1146,11 @@ class ExperimentTracker:
                 "timestamp": datetime.now().isoformat(),
             }
             if self.backends.get("mongodb"):
-                self.backends["mongodb"].store_business_metrics(self.experiment_id, payload)
+                self._submit("mongodb", "store_business_metrics", self.experiment_id, payload)
             if self.backends.get("mlflow"):
-                self.backends["mlflow"].log_metric("total_cost_manual", float(cost))
+                self._submit("mlflow", "log_metric", "total_cost_manual", float(cost), step=None)
                 note = comments + ("\n\nConclusion: " + conclusion if conclusion else "")
-                self.backends["mlflow"].log_text(note, "business/notes.txt")
+                self._submit("mlflow", "log_text", note, artifact_file="business/notes.txt", async_ok=False)
             self.total_cost += float(cost)
             print(f"💰 Logged business metrics (manual): €{cost:.2f}")
         except Exception as e:  # pragma: no cover
@@ -942,7 +1170,7 @@ class ExperimentTracker:
                     "start_timestamp": self.start_time.isoformat(),
                 }
                 meta.update(self.tags)
-                self.backends["mlflow"].set_tags(meta)
+                self._exec_with_retry("mlflow", "set_tags", meta)
         except Exception as e:  # pragma: no cover
             self.logger.error(f"Failed to log experiment metadata: {e}")
 
@@ -958,8 +1186,8 @@ class ExperimentTracker:
                 pass
             if self.backends.get("mlflow"):
                 env_tags = self.env_tagger.get_mlflow_tags(env_info)
-                self.backends["mlflow"].set_tags(env_tags)
-                self.backends["mlflow"].log_dict(env_info, "environment_info.json")
+                self._exec_with_retry("mlflow", "set_tags", env_tags)
+                self._exec_with_retry("mlflow", "log_dict", env_info, artifact_file="environment_info.json")
         except Exception as e:  # pragma: no cover
             self.logger.error(f"Failed to log environment: {e}")
 
@@ -1026,10 +1254,10 @@ class ExperimentTracker:
 
         if log_to_backends:
             if self.backends.get("mlflow"):
-                self.backends["mlflow"].log_dict(out, "results/summary.json")
+                self._submit("mlflow", "log_dict", out, artifact_file="results/summary.json")
             if self.backends.get("mongodb"):
                 try:
-                    self.backends["mongodb"].store_results(self.experiment_id, {"kind": "results_summary", **out})
+                    self._submit("mongodb", "store_results", self.experiment_id, {"kind": "results_summary", **out})
                 except Exception:
                     pass
         return out

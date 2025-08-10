@@ -1,22 +1,23 @@
-"""
-Environment Tagger for LeZeA MLOps — FINAL
-==========================================
-
-- Hardware specs (CPU, GPU, RAM, disk, net)
-- Software env (OS, Python, key pkgs)
-- Git repo info + last commit/date
-- Container (Docker/K8s) + cloud detection (AWS/GCP/Azure)
-- Optional dataset fingerprinting (directory hash/size/count)
-- MLflow-safe tag generation
-- Export + reproducibility hash
-
-Public methods used by your tracker:
-- get_environment_info()
-- get_mlflow_tags(env_info=None)
-- get_git_info()   <-- new public wrapper
-- export_environment(filepath, include_sensitive=False)
-- get_reproducibility_hash()
-"""
+# lezea_mlops/monitoring/env_tags.py
+#
+# Environment Tagger for LeZeA MLOps — FINAL+
+# -------------------------------------------
+# - Hardware specs (CPU, GPU, RAM, disk, net)
+# - Software env (OS, Python, key pkgs)
+# - Git repo info + last commit/date (with env fallbacks)
+# - Container (Docker/K8s) + cloud detection (AWS/GCP/Azure)
+# - Optional dataset fingerprinting (directory hash/size/count)
+# - MLflow-safe tag generation (length-guarded)
+# - Export + reproducibility hash
+#
+# Public methods:
+#   - get_environment_info()
+#   - get_mlflow_tags(env_info: dict | None = None)
+#   - get_git_info()
+#   - export_environment(filepath: str, include_sensitive: bool = False)
+#   - get_reproducibility_hash()
+#
+# All calls degrade gracefully and never raise in normal operation.
 
 from __future__ import annotations
 
@@ -33,56 +34,65 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Optional libs
 try:
-    import psutil
+    import psutil  # type: ignore
     PSUTIL_AVAILABLE = True
 except Exception:
-    psutil = None
+    psutil = None  # type: ignore
     PSUTIL_AVAILABLE = False
 
+# Prefer importlib.metadata over pkg_resources; fall back if needed
 try:
-    import pkg_resources
+    from importlib import metadata as importlib_metadata  # py>=3.8
+    IMPORTLIB_METADATA_AVAILABLE = True
+except Exception:
+    importlib_metadata = None  # type: ignore
+    IMPORTLIB_METADATA_AVAILABLE = False
+
+try:
+    import pkg_resources  # type: ignore
     PKG_RESOURCES_AVAILABLE = True
 except Exception:
-    pkg_resources = None
+    pkg_resources = None  # type: ignore
     PKG_RESOURCES_AVAILABLE = False
 
 try:
-    import GPUtil
+    import GPUtil  # type: ignore
     GPUTIL_AVAILABLE = True
 except Exception:
-    GPUtil = None
+    GPUtil = None  # type: ignore
     GPUTIL_AVAILABLE = False
 
 try:
-    import pynvml
+    import pynvml  # type: ignore
     PYNVML_AVAILABLE = True
 except Exception:
-    pynvml = None
+    pynvml = None  # type: ignore
     PYNVML_AVAILABLE = False
 
 try:
-    import torch
+    import torch  # type: ignore
     TORCH_AVAILABLE = True
 except Exception:
-    torch = None
+    torch = None  # type: ignore
     TORCH_AVAILABLE = False
 
 # urllib (for cloud metadata)
 try:
-    import urllib.request as _urlreq
-    import urllib.error as _urlerr
+    import urllib.request as _urlreq  # type: ignore
+    import urllib.error as _urlerr  # type: ignore
     _URL_OK = True
 except Exception:
     _URL_OK = False
-    _urlreq = None
-    _urlerr = None
+    _urlreq = None  # type: ignore
+    _urlerr = None  # type: ignore
 
 
 class EnvironmentTagger:
     def __init__(self) -> None:
-        self.cache: Dict[str, Any] = {}
+        self._cache: Dict[str, Any] = {}
         self.git_available = self._check_git_available()
         self.docker_available = self._check_docker_available()
+        # One-line init print to help users see it loaded (quiet in prod)
         print("🔍 Environment tagger initialized")
 
     # ------------------------
@@ -90,9 +100,7 @@ class EnvironmentTagger:
     # ------------------------
     def _run(self, cmd: List[str], *, timeout: float = 3.0) -> Optional[subprocess.CompletedProcess]:
         try:
-            return subprocess.run(
-                cmd, capture_output=True, text=True, check=True, timeout=timeout
-            )
+            return subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
         except Exception:
             return None
 
@@ -107,7 +115,7 @@ class EnvironmentTagger:
             cg = Path("/proc/1/cgroup")
             if cg.exists():
                 txt = cg.read_text(errors="ignore")
-                return "docker" in txt or "containerd" in txt
+                return ("docker" in txt) or ("containerd" in txt)
         except Exception:
             pass
         return False
@@ -116,6 +124,11 @@ class EnvironmentTagger:
     # Public surface
     # ------------------------
     def get_environment_info(self) -> Dict[str, Any]:
+        # Simple cache to avoid repeated heavy calls in a single process
+        cache_key = "env_info"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
         env = {
             "collection_timestamp": datetime.now().isoformat(),
             "system": self._get_system_info(),
@@ -136,24 +149,28 @@ class EnvironmentTagger:
                 env["dataset_fingerprint"] = self.get_dataset_fingerprint(ds_root)
         except Exception:
             pass
+
+        self._cache[cache_key] = env
         return env
 
     def get_git_info(self) -> Dict[str, Any]:
-        """Public wrapper (your tracker calls hasattr(...,'get_git_info'))."""
+        """Public wrapper (the tracker calls hasattr(...,'get_git_info'))."""
         return self._get_git_info()
 
     def get_mlflow_tags(self, env_info: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
         if env_info is None:
             env_info = self.get_environment_info()
-
         try:
             tags: Dict[str, str] = {}
 
             # System
             system = env_info.get("system", {})
             tags["system.hostname"] = system.get("hostname", "unknown")
-            tags["system.platform"] = system.get("system", "unknown")
+            tags["system.os"] = system.get("system", "unknown")
             tags["system.architecture"] = system.get("architecture", "unknown")
+            # Nice to have
+            if system.get("release"):
+                tags["system.release"] = system["release"]
 
             # Hardware
             hw = env_info.get("hardware", {})
@@ -171,9 +188,10 @@ class EnvironmentTagger:
             if gpu.get("count"):
                 tags["hardware.gpu_count"] = str(gpu["count"])
             if gpu.get("devices"):
-                names = [d.get("name", "gpu") for d in gpu["devices"][:3]]
-                tags["hardware.gpu_types"] = ",".join(names)
-            if gpu.get("cuda_available"):
+                names = [d.get("name", "gpu") for d in gpu["devices"][:3] if d.get("name")]
+                if names:
+                    tags["hardware.gpu_types"] = ",".join(names)
+            if gpu.get("cuda_available") is not None:
                 tags["hardware.cuda_available"] = str(gpu.get("cuda_available"))
             if gpu.get("cuda_version"):
                 tags["hardware.cuda_version"] = str(gpu.get("cuda_version"))
@@ -193,14 +211,14 @@ class EnvironmentTagger:
             # Packages (key ones only)
             pk = env_info.get("packages", {}).get("key_packages", {})
             for k in ("torch", "tensorflow", "numpy", "pandas", "scikit-learn", "mlflow", "dvc"):
-                if k in pk:
+                if pk.get(k):
                     tags[f"package.{k}"] = pk[k]
 
             # Git
             git = env_info.get("git", {})
             tags["git.available"] = "true" if git.get("is_repo") else "false"
             if git.get("commit"):
-                tags["git.commit"] = git["commit"][:8]
+                tags["git.commit"] = git["commit"][:12]
             if git.get("branch"):
                 tags["git.branch"] = git["branch"]
             if git.get("status"):
@@ -258,7 +276,11 @@ class EnvironmentTagger:
                 # Scrub sensitive env vars and network detail
                 if "environment" in info:
                     tracked = info["environment"].get("tracked_variables", {})
-                    redact = {k: v for k, v in tracked.items() if "KEY" not in k.upper() and "SECRET" not in k.upper() and "TOKEN" not in k.upper()}
+                    redact = {
+                        k: v
+                        for k, v in tracked.items()
+                        if ("KEY" not in k.upper() and "SECRET" not in k.upper() and "TOKEN" not in k.upper())
+                    }
                     info["environment"]["tracked_variables"] = redact
                 if "hardware" in info and "network" in info["hardware"]:
                     net = info["hardware"]["network"]
@@ -266,7 +288,7 @@ class EnvironmentTagger:
                         "hostname": net.get("hostname"),
                         "interface_count": len(net.get("interfaces", [])),
                     }
-            with open(filepath, "w") as f:
+            with open(filepath, "w", encoding="utf-8") as f:
                 json.dump(info, f, indent=2, default=str)
             print(f"💾 Exported environment info to: {filepath}")
         except Exception as e:
@@ -278,9 +300,10 @@ class EnvironmentTagger:
             data = {
                 "python_version": info.get("python", {}).get("version_info", {}),
                 "key_packages": info.get("packages", {}).get("key_packages", {}),
-                "git_commit": info.get("git", {}).get("commit"),
-                "platform": info.get("system", {}).get("platform"),
+                "git_commit": info.get("git", {}).get("commit") or os.getenv("GIT_COMMIT"),
+                "platform": info.get("system", {}).get("system"),
                 "architecture": info.get("system", {}).get("architecture"),
+                "cuda": info.get("hardware", {}).get("gpu", {}).get("cuda_version"),
             }
             return hashlib.sha256(json.dumps(data, sort_keys=True).encode("utf-8")).hexdigest()
         except Exception as e:
@@ -315,6 +338,14 @@ class EnvironmentTagger:
                     out["bios_version"] = bios_v.read_text().strip()
             except Exception:
                 pass
+            # WSL hint
+            try:
+                with open("/proc/version", "r") as f:
+                    txt = f.read()
+                if "Microsoft" in txt or "WSL" in txt:
+                    out["wsl"] = True
+            except Exception:
+                pass
             return out
         except Exception as e:
             return {"error": f"Failed to get system info: {e}"}
@@ -339,14 +370,13 @@ class EnvironmentTagger:
                 "max_frequency": None,
                 "current_frequency": None,
                 "usage_percent": None,
-                "model": platform.processor(),
+                "model": platform.processor() or None,
             }
             if PSUTIL_AVAILABLE:
                 out["physical_cores"] = psutil.cpu_count(logical=False)
                 out["logical_cores"] = psutil.cpu_count(logical=True)
                 try:
-                    # Non-blocking instantaneous pct
-                    out["usage_percent"] = psutil.cpu_percent(interval=0.0)
+                    out["usage_percent"] = psutil.cpu_percent(interval=0.0)  # non-blocking
                 except Exception:
                     pass
                 try:
@@ -372,12 +402,14 @@ class EnvironmentTagger:
             }
             if PSUTIL_AVAILABLE:
                 vm = psutil.virtual_memory()
-                out.update({
-                    "total_gb": round(vm.total / (1024**3), 2),
-                    "available_gb": round(vm.available / (1024**3), 2),
-                    "used_gb": round(vm.used / (1024**3), 2),
-                    "usage_percent": vm.percent,
-                })
+                out.update(
+                    {
+                        "total_gb": round(vm.total / (1024**3), 2),
+                        "available_gb": round(vm.available / (1024**3), 2),
+                        "used_gb": round(vm.used / (1024**3), 2),
+                        "usage_percent": vm.percent,
+                    }
+                )
                 try:
                     sw = psutil.swap_memory()
                     out["swap_total_gb"] = round(sw.total / (1024**3), 2)
@@ -391,7 +423,10 @@ class EnvironmentTagger:
     def _nvidia_smi_query(self) -> Dict[str, Any]:
         info: Dict[str, Any] = {}
         try:
-            r = self._run(["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"])
+            r = self._run(
+                ["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"],
+                timeout=2.0,
+            )
             if not r or r.returncode != 0:
                 return info
             lines = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
@@ -429,24 +464,26 @@ class EnvironmentTagger:
             }
             devices: List[Dict[str, Any]] = []
 
-            # Fast path: GPUtil
+            # GPUtil (fast path)
             if GPUTIL_AVAILABLE:
                 try:
                     for g in GPUtil.getGPUs():
-                        devices.append({
-                            "id": g.id,
-                            "name": g.name,
-                            "memory_total_mb": g.memoryTotal,
-                            "memory_used_mb": g.memoryUsed,
-                            "memory_free_mb": g.memoryFree,
-                            "load_percent": round(getattr(g, "load", 0.0) * 100, 1),
-                            "temperature_c": getattr(g, "temperature", None),
-                            "uuid": getattr(g, "uuid", None),
-                        })
+                        devices.append(
+                            {
+                                "id": g.id,
+                                "name": g.name,
+                                "memory_total_mb": getattr(g, "memoryTotal", None),
+                                "memory_used_mb": getattr(g, "memoryUsed", None),
+                                "memory_free_mb": getattr(g, "memoryFree", None),
+                                "load_percent": round(getattr(g, "load", 0.0) * 100, 1),
+                                "temperature_c": getattr(g, "temperature", None),
+                                "uuid": getattr(g, "uuid", None),
+                            }
+                        )
                 except Exception:
                     pass
 
-            # NVML
+            # NVML (driver + mem)
             if not devices and PYNVML_AVAILABLE:
                 try:
                     pynvml.nvmlInit()
@@ -455,13 +492,15 @@ class EnvironmentTagger:
                         h = pynvml.nvmlDeviceGetHandleByIndex(i)
                         name = pynvml.nvmlDeviceGetName(h).decode("utf-8")
                         mem = pynvml.nvmlDeviceGetMemoryInfo(h)
-                        devices.append({
-                            "id": i,
-                            "name": name,
-                            "memory_total_mb": mem.total // (1024**2),
-                            "memory_used_mb": mem.used // (1024**2),
-                            "memory_free_mb": mem.free // (1024**2),
-                        })
+                        devices.append(
+                            {
+                                "id": i,
+                                "name": name,
+                                "memory_total_mb": mem.total // (1024**2),
+                                "memory_used_mb": mem.used // (1024**2),
+                                "memory_free_mb": mem.free // (1024**2),
+                            }
+                        )
                     try:
                         out["driver_version"] = pynvml.nvmlSystemGetDriverVersion().decode("utf-8")
                     except Exception:
@@ -474,7 +513,7 @@ class EnvironmentTagger:
                     except Exception:
                         pass
 
-            # nvidia-smi (for driver/mem if still empty)
+            # nvidia-smi (fallback)
             if not devices:
                 smi = self._nvidia_smi_query()
                 if smi.get("devices"):
@@ -487,19 +526,21 @@ class EnvironmentTagger:
                 try:
                     out["cuda_available"] = torch.cuda.is_available()
                     if out["cuda_available"]:
-                        out["cuda_version"] = torch.version.cuda
+                        out["cuda_version"] = getattr(torch.version, "cuda", None)
                         # If no devices yet, at least list names from torch
                         if not devices:
                             n = torch.cuda.device_count()
                             for i in range(n):
                                 p = torch.cuda.get_device_properties(i)
-                                devices.append({
-                                    "id": i,
-                                    "name": p.name,
-                                    "memory_total_mb": p.total_memory // (1024**2),
-                                    "compute_capability": f"{p.major}.{p.minor}",
-                                    "multiprocessor_count": p.multi_processor_count,
-                                })
+                                devices.append(
+                                    {
+                                        "id": i,
+                                        "name": p.name,
+                                        "memory_total_mb": p.total_memory // (1024**2),
+                                        "compute_capability": f"{p.major}.{p.minor}",
+                                        "multiprocessor_count": p.multi_processor_count,
+                                    }
+                                )
                 except Exception:
                     pass
 
@@ -513,9 +554,12 @@ class EnvironmentTagger:
 
     def _get_disk_info(self) -> Dict[str, Any]:
         try:
-            out: Dict[str, Any] = {"partitions": [], "total_gb": 0, "used_gb": 0, "free_gb": 0}
+            out: Dict[str, Any] = {"partitions": [], "total_gb": 0.0, "used_gb": 0.0, "free_gb": 0.0}
             if PSUTIL_AVAILABLE:
                 for part in psutil.disk_partitions():
+                    # Skip pseudo FS that can raise perms error
+                    if part.fstype in ("", "squashfs"):
+                        continue
                     try:
                         usage = psutil.disk_usage(part.mountpoint)
                         row = {
@@ -528,6 +572,7 @@ class EnvironmentTagger:
                             "usage_percent": round(usage.percent, 1),
                         }
                         out["partitions"].append(row)
+                        # Aggregate only primary mounts (/, C:\) to keep numbers meaningful
                         if part.mountpoint in ("/", "C:\\"):
                             out["total_gb"] += row["total_gb"]
                             out["used_gb"] += row["used_gb"]
@@ -545,12 +590,14 @@ class EnvironmentTagger:
                 for name, addrs in psutil.net_if_addrs().items():
                     iface = {"name": name, "addresses": []}
                     for a in addrs:
-                        iface["addresses"].append({
-                            "family": str(a.family),
-                            "address": a.address,
-                            "netmask": getattr(a, "netmask", None),
-                            "broadcast": getattr(a, "broadcast", None),
-                        })
+                        iface["addresses"].append(
+                            {
+                                "family": str(a.family),
+                                "address": a.address,
+                                "netmask": getattr(a, "netmask", None),
+                                "broadcast": getattr(a, "broadcast", None),
+                            }
+                        )
                     out["interfaces"].append(iface)
             return out
         except Exception as e:
@@ -566,11 +613,7 @@ class EnvironmentTagger:
                 "user": os.getenv("USER") or os.getenv("USERNAME"),
                 "home": os.getenv("HOME") or os.getenv("USERPROFILE"),
                 "path_entries": len(os.getenv("PATH", "").split(os.pathsep)),
-                "locale": {
-                    "lang": os.getenv("LANG"),
-                    "lc_all": os.getenv("LC_ALL"),
-                    "timezone": os.getenv("TZ"),
-                },
+                "locale": {"lang": os.getenv("LANG"), "lc_all": os.getenv("LC_ALL"), "timezone": os.getenv("TZ")},
             }
         except Exception as e:
             return {"error": f"Failed to get software info: {e}"}
@@ -579,7 +622,11 @@ class EnvironmentTagger:
         try:
             info: Dict[str, Any] = {
                 "version": sys.version,
-                "version_info": {"major": sys.version_info.major, "minor": sys.version_info.minor, "micro": sys.version_info.micro},
+                "version_info": {
+                    "major": sys.version_info.major,
+                    "minor": sys.version_info.minor,
+                    "micro": sys.version_info.micro,
+                },
                 "executable": sys.executable,
                 "prefix": sys.prefix,
                 "path": sys.path[:5],
@@ -589,7 +636,11 @@ class EnvironmentTagger:
                 "build": platform.python_build(),
                 "api_version": sys.api_version,
                 "maxsize": sys.maxsize,
-                "float_info": {"max": sys.float_info.max, "epsilon": sys.float_info.epsilon, "dig": sys.float_info.dig},
+                "float_info": {
+                    "max": sys.float_info.max,
+                    "epsilon": sys.float_info.epsilon,
+                    "dig": sys.float_info.dig,
+                },
             }
             # venv
             info["virtual_env"] = bool(
@@ -607,17 +658,50 @@ class EnvironmentTagger:
         try:
             out: Dict[str, Any] = {"package_count": 0, "key_packages": {}, "pip_packages": []}
             keys = [
-                "torch", "tensorflow", "numpy", "pandas", "scikit-learn",
-                "matplotlib", "jupyter", "mlflow", "dvc", "boto3", "pymongo", "psycopg2", "requests", "fastapi",
+                "torch",
+                "tensorflow",
+                "numpy",
+                "pandas",
+                "scikit-learn",
+                "matplotlib",
+                "jupyter",
+                "mlflow",
+                "dvc",
+                "boto3",
+                "pymongo",
+                "psycopg2",
+                "requests",
+                "fastapi",
             ]
-            if PKG_RESOURCES_AVAILABLE:
-                installed = {pkg.project_name: pkg.version for pkg in pkg_resources.working_set}
-                out["package_count"] = len(installed)
-                for k in keys:
-                    if k in installed:
-                        out["key_packages"][k] = installed[k]
-                # keep list short for logs
-                out["pip_packages"] = [f"{n}=={v}" for n, v in list(installed.items())[:100]]
+
+            packages: Dict[str, str] = {}
+
+            if IMPORTLIB_METADATA_AVAILABLE:
+                try:
+                    for dist in importlib_metadata.distributions():
+                        name = (getattr(dist, "metadata", None) or {}).get("Name") or dist.metadata["Name"]
+                        version = dist.version
+                        if name and version:
+                            packages[name.lower()] = version
+                except Exception:
+                    # fall back to pkg_resources below
+                    pass
+
+            if not packages and PKG_RESOURCES_AVAILABLE:
+                installed = {pkg.project_name.lower(): pkg.version for pkg in pkg_resources.working_set}
+                packages.update(installed)
+
+            out["package_count"] = len(packages)
+            for k in keys:
+                if k in packages:
+                    out["key_packages"][k] = packages[k]
+
+            # keep list short for logs
+            if packages:
+                # show first 100 pkgs deterministically
+                items = sorted(packages.items())[:100]
+                out["pip_packages"] = [f"{n}=={v}" for n, v in items]
+
             return out
         except Exception as e:
             return {"error": f"Failed to get package info: {e}"}
@@ -627,11 +711,11 @@ class EnvironmentTagger:
             info: Dict[str, Any] = {
                 "available": self.git_available,
                 "is_repo": False,
-                "commit": None,
-                "branch": None,
+                "commit": os.getenv("GIT_COMMIT"),  # env fallback
+                "branch": os.getenv("GIT_BRANCH"),
                 "remote_url": None,
                 "status": None,
-                "tag": None,
+                "tag": os.getenv("GIT_TAG"),
                 "commit_count": None,
                 "last_commit_date": None,
             }
@@ -648,15 +732,18 @@ class EnvironmentTagger:
                 rr = self._run(cmd)
                 return rr.stdout.strip() if rr and rr.stdout else None
 
-            info["commit"] = _grab(["git", "rev-parse", "HEAD"])
-            info["branch"] = _grab(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+            info["commit"] = _grab(["git", "rev-parse", "HEAD"]) or info.get("commit")
+            info["branch"] = _grab(["git", "rev-parse", "--abbrev-ref", "HEAD"]) or info.get("branch")
             info["remote_url"] = _grab(["git", "config", "--get", "remote.origin.url"])
             # porcelain status (clean/dirty)
             st = self._run(["git", "status", "--porcelain"])
             info["status"] = "clean" if (st and not st.stdout.strip()) else "dirty"
-            info["tag"] = _grab(["git", "describe", "--tags", "--abbrev=0"]) or None
+            info["tag"] = _grab(["git", "describe", "--tags", "--abbrev=0"]) or info.get("tag")
             cc = _grab(["git", "rev-list", "--count", "HEAD"])
-            info["commit_count"] = int(cc) if (cc and cc.isdigit()) else None
+            try:
+                info["commit_count"] = int(cc) if cc and cc.isdigit() else None
+            except Exception:
+                info["commit_count"] = None
             info["last_commit_date"] = _grab(["git", "log", "-1", "--format=%ci"])
             return info
         except Exception as e:
@@ -665,12 +752,21 @@ class EnvironmentTagger:
     def _get_environment_variables(self) -> Dict[str, Any]:
         try:
             keys = [
-                "PATH", "PYTHONPATH", "HOME", "USER", "SHELL",
-                "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES",
-                "OMP_NUM_THREADS", "MKL_NUM_THREADS",
-                "CONDA_DEFAULT_ENV", "VIRTUAL_ENV",
-                "AWS_REGION", "AWS_DEFAULT_REGION",
-                "MLFLOW_TRACKING_URI", "MONGO_CONNECTION_STRING",
+                "PATH",
+                "PYTHONPATH",
+                "HOME",
+                "USER",
+                "SHELL",
+                "CUDA_VISIBLE_DEVICES",
+                "NVIDIA_VISIBLE_DEVICES",
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "CONDA_DEFAULT_ENV",
+                "VIRTUAL_ENV",
+                "AWS_REGION",
+                "AWS_DEFAULT_REGION",
+                "MLFLOW_TRACKING_URI",
+                "MONGO_CONNECTION_STRING",
             ]
             tracked: Dict[str, str] = {}
             for k in keys:
@@ -702,7 +798,7 @@ class EnvironmentTagger:
         try:
             info: Dict[str, Any] = {"kernel_version": platform.release()}
             try:
-                with open("/etc/os-release", "r") as f:
+                with open("/etc/os-release", "r", encoding="utf-8") as f:
                     for line in f:
                         if line.startswith("ID="):
                             info["distro_id"] = line.split("=", 1)[1].strip().strip('"')
@@ -714,7 +810,7 @@ class EnvironmentTagger:
                 pass
             # CPU model from /proc/cpuinfo
             try:
-                with open("/proc/cpuinfo", "r") as f:
+                with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
                     for ln in f:
                         if ln.lower().startswith("model name"):
                             info["cpu_model"] = ln.split(":", 1)[1].strip()
@@ -763,7 +859,10 @@ class EnvironmentTagger:
             return out
         # AWS
         try:
-            req = _urlreq.Request("http://169.254.169.254/latest/meta-data/instance-type", headers={"User-Agent": "curl/7"})
+            req = _urlreq.Request(
+                "http://169.254.169.254/latest/meta-data/instance-type",
+                headers={"User-Agent": "curl/7"},
+            )
             with _urlreq.urlopen(req, timeout=1.5) as resp:
                 out.update({"detected": True, "platform": "AWS", "instance_type": resp.read().decode("utf-8")})
             # Region & AZ (best-effort)
@@ -773,7 +872,9 @@ class EnvironmentTagger:
             except Exception:
                 pass
             try:
-                with _urlreq.urlopen("http://169.254.169.254/latest/meta-data/placement/availability-zone", timeout=1.0) as r3:
+                with _urlreq.urlopen(
+                    "http://169.254.169.254/latest/meta-data/placement/availability-zone", timeout=1.0
+                ) as r3:
                     out["availability_zone"] = r3.read().decode("utf-8")
             except Exception:
                 pass
@@ -800,6 +901,16 @@ class EnvironmentTagger:
             )
             with _urlreq.urlopen(req, timeout=1.5) as resp:
                 out.update({"detected": True, "platform": "Azure", "instance_type": resp.read().decode("utf-8")})
+            # Region best-effort
+            try:
+                req2 = _urlreq.Request(
+                    "http://169.254.169.254/metadata/instance/compute/location",
+                    headers={"Metadata": "true"},
+                )
+                with _urlreq.urlopen(req2, timeout=1.0) as r:
+                    out["region"] = r.read().decode("utf-8")
+            except Exception:
+                pass
             return out
         except Exception:
             pass
@@ -807,19 +918,24 @@ class EnvironmentTagger:
 
     def _get_container_info(self) -> Dict[str, Any]:
         try:
-            info: Dict[str, Any] = {"docker": self.docker_available, "kubernetes": False, "container_id": None, "image_name": None}
+            info: Dict[str, Any] = {
+                "docker": self.docker_available,
+                "kubernetes": False,
+                "container_id": None,
+                "image_name": None,
+            }
             # K8s
             if os.path.exists("/var/run/secrets/kubernetes.io/serviceaccount") or os.getenv("KUBERNETES_SERVICE_HOST"):
                 info["kubernetes"] = True
                 try:
-                    with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "r") as f:
+                    with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace", "r", encoding="utf-8") as f:
                         info["k8s_namespace"] = f.read().strip()
                 except Exception:
                     pass
             # Docker container ID
             if self.docker_available:
                 try:
-                    with open("/proc/self/cgroup", "r") as f:
+                    with open("/proc/self/cgroup", "r", encoding="utf-8") as f:
                         for line in f:
                             if "docker" in line or "containerd" in line:
                                 info["container_id"] = line.strip().split("/")[-1][:12]
@@ -847,7 +963,8 @@ class EnvironmentTagger:
         count = 0
         try:
             if root.exists():
-                for i, fp in enumerate(sorted(root.rglob("*"))):
+                i = 0
+                for fp in sorted(root.rglob("*")):
                     if i >= max_files:
                         break
                     if fp.is_file():
@@ -860,6 +977,7 @@ class EnvironmentTagger:
                         count += 1
                         h.update(rel.encode("utf-8"))
                         h.update(str(size).encode("utf-8"))
+                        i += 1
             digest = h.hexdigest()
             return {
                 "root": str(root),
@@ -877,7 +995,7 @@ class EnvironmentTagger:
     def compare_environments(self, other_env_file: str) -> Dict[str, Any]:
         try:
             current_env = self.get_environment_info()
-            with open(other_env_file, "r") as f:
+            with open(other_env_file, "r", encoding="utf-8") as f:
                 other_env = json.load(f)
             comp: Dict[str, Any] = {
                 "comparison_timestamp": datetime.now().isoformat(),
@@ -907,23 +1025,29 @@ class EnvironmentTagger:
         score = 0.0
         try:
             if section_name == "system":
-                if current.get("platform") == other.get("platform"):
-                    similarities["platform"] = current.get("platform")
+                if current.get("system") == other.get("system"):
+                    similarities["os"] = current.get("system")
                     score += 0.5
                 else:
-                    differences["platform"] = {"current": current.get("platform"), "other": other.get("platform")}
+                    differences["os"] = {"current": current.get("system"), "other": other.get("system")}
                 if current.get("architecture") == other.get("architecture"):
                     similarities["architecture"] = current.get("architecture")
                     score += 0.5
                 else:
-                    differences["architecture"] = {"current": current.get("architecture"), "other": other.get("architecture")}
+                    differences["architecture"] = {
+                        "current": current.get("architecture"),
+                        "other": other.get("architecture"),
+                    }
             elif section_name == "hardware":
                 c_cpu, o_cpu = current.get("cpu", {}), other.get("cpu", {})
                 if c_cpu.get("physical_cores") == o_cpu.get("physical_cores"):
                     similarities["cpu_cores"] = c_cpu.get("physical_cores")
                     score += 0.25
                 else:
-                    differences["cpu_cores"] = {"current": c_cpu.get("physical_cores"), "other": o_cpu.get("physical_cores")}
+                    differences["cpu_cores"] = {
+                        "current": c_cpu.get("physical_cores"),
+                        "other": o_cpu.get("physical_cores"),
+                    }
                 c_mem, o_mem = current.get("memory", {}), other.get("memory", {})
                 cg, og = c_mem.get("total_gb", 0) or 0, o_mem.get("total_gb", 0) or 0
                 if abs(cg - og) < 1:
@@ -941,7 +1065,10 @@ class EnvironmentTagger:
                     elif c_gpu.get("available"):
                         differences["gpu_count"] = {"current": c_gpu.get("count"), "other": o_gpu.get("count")}
                 else:
-                    differences["gpu_available"] = {"current": c_gpu.get("available"), "other": o_gpu.get("available")}
+                    differences["gpu_available"] = {
+                        "current": c_gpu.get("available"),
+                        "other": o_gpu.get("available"),
+                    }
             elif section_name == "python":
                 cv, ov = current.get("version_info", {}), other.get("version_info", {})
                 if (cv.get("major"), cv.get("minor")) == (ov.get("major"), ov.get("minor")):
@@ -956,7 +1083,10 @@ class EnvironmentTagger:
                     similarities["virtual_env"] = current.get("virtual_env")
                     score += 0.5
                 else:
-                    differences["virtual_env"] = {"current": current.get("virtual_env"), "other": other.get("virtual_env")}
+                    differences["virtual_env"] = {
+                        "current": current.get("virtual_env"),
+                        "other": other.get("virtual_env"),
+                    }
             elif section_name == "packages":
                 cp, op = current.get("key_packages", {}), other.get("key_packages", {})
                 common = set(cp) & set(op)
@@ -978,5 +1108,5 @@ class EnvironmentTagger:
 
     # ------------------------
     def cleanup(self) -> None:
-        self.cache.clear()
+        self._cache.clear()
         print("🧹 Environment tagger cleaned up")

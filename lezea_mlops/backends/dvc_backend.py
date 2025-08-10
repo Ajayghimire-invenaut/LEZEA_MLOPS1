@@ -1,21 +1,5 @@
-"""
-DVC Backend for LeZeA MLOps — FINAL
-===================================
-
-What this gives you
--------------------
-- Safe, graceful setup: works even if DVC or PyYAML aren't installed.
-- Dataset tracking (`track_dataset`) with optional metadata injected into the .dvc file.
-- One-call dataset versioning (`version_dataset`) that:
-  * tracks paths, builds a manifest, tags in Git, and (optionally) pushes.
-- Active dataset fingerprinting (`get_active_dataset_version`) used by the tracker:
-  * reads `dvc.lock` (or all .dvc files) to compute a stable version hash,
-    returns `version_tag`, `file_count`, `total_size_mb`, `git_commit`, etc.
-- Remotes, push/pull, integrity validation, lineage, and pipeline helpers.
-- Clean JSON structures, consistent with what the tracker expects.
-
-All operations degrade cleanly when DVC/PyYAML/Git aren’t available.
-"""
+# lezea_mlops/backends/dvc_backend.py
+# DVC Backend for LeZeA MLOps — hardened
 
 from __future__ import annotations
 
@@ -23,15 +7,15 @@ import os
 import json
 import subprocess
 import hashlib
+import shutil
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 from pathlib import Path
 
 # Optional deps
 try:
     import dvc.api  # noqa: F401
     import dvc.repo
-    from dvc.exceptions import DvcException
     DVC_AVAILABLE = True
 except Exception:
     DVC_AVAILABLE = False
@@ -46,30 +30,29 @@ except Exception:
 class DVCBackend:
     """
     DVC backend for dataset versioning and data pipeline management.
+
+    Notes:
+    - Exposes `.available` and `ping()` so the tracker health check works.
+    - Degrades gracefully when DVC / PyYAML / git CLI are missing.
     """
 
     def __init__(self, config):
-        """
-        Initialize the DVC backend. No-op if DVC (or PyYAML) is missing.
-
-        Args:
-            config: Your project config object (not strictly required).
-        """
         self.config = config
-        # Try to honor a project root from config, otherwise CWD
         self.project_root: Path = Path(getattr(config, "project_root", Path.cwd()))
         self.dvc_dir = self.project_root / ".dvc"
         self.data_dir = self.project_root / "data"
 
         self.repo = None
-        self.available = False
-        self.is_initialized = False
+        self.available: bool = False
+        self.is_initialized: bool = False
+        self._dvc_cli_ok: bool = shutil.which("dvc") is not None
+        self._git_cli_ok: bool = shutil.which("git") is not None
 
         if not DVC_AVAILABLE:
-            print("⚠️  DVC not available. Install with: pip install 'dvc[s3]'")
+            print("⚠️  DVC python package not available. Install: pip install 'dvc[s3]'")
             return
         if not YAML_AVAILABLE:
-            print("⚠️  PyYAML not available. Install with: pip install PyYAML")
+            print("⚠️  PyYAML not available. Install: pip install PyYAML")
             return
 
         self.is_initialized = self._check_dvc_initialized()
@@ -79,21 +62,21 @@ class DVCBackend:
                 self.available = True
                 print("✅ DVC backend ready")
             except Exception as e:
-                print(f"⚠️  DVC repo initialization failed: {e}")
+                print(f"⚠️  DVC repo open failed: {e}")
         else:
             print("⚠️  DVC not initialized in this project (run `dvc init`).")
 
     # ---------------------------------------------------------------------
-    # Basics / utilities
+    # Health
     # ---------------------------------------------------------------------
-    def _check_dvc_initialized(self) -> bool:
-        return self.dvc_dir.exists() and (self.dvc_dir / "config").exists()
+    def ping(self) -> bool:
+        """Used by tracker._health_check()."""
+        return bool(self.available and self.is_initialized)
 
+    # ---------------------------------------------------------------------
+    # Shell helpers
+    # ---------------------------------------------------------------------
     def _run(self, cmd: List[str], *, capture_output: bool = True) -> subprocess.CompletedProcess:
-        """
-        Run a shell command relative to project root.
-        Raises on failure so callers can handle.
-        """
         return subprocess.run(
             cmd,
             cwd=self.project_root,
@@ -103,15 +86,13 @@ class DVCBackend:
         )
 
     def _dvc(self, args: List[str], *, capture_output: bool = True) -> subprocess.CompletedProcess:
-        """
-        Run `dvc <args>`.
-        """
+        if not self._dvc_cli_ok:
+            raise FileNotFoundError("`dvc` CLI not found in PATH")
         return self._run(["dvc"] + args, capture_output=capture_output)
 
     def _git(self, args: List[str], *, capture_output: bool = True) -> Optional[subprocess.CompletedProcess]:
-        """
-        Run `git <args>` if git is available; return None on FileNotFoundError.
-        """
+        if not self._git_cli_ok:
+            return None
         try:
             return self._run(["git"] + args, capture_output=capture_output)
         except FileNotFoundError:
@@ -125,9 +106,6 @@ class DVCBackend:
             return False
 
     def _git_commit(self, message: str, add_paths: Optional[List[str]] = None) -> Optional[str]:
-        """
-        Add and commit files; returns commit sha (short) if possible.
-        """
         if not self._git_is_repo():
             return None
         try:
@@ -139,20 +117,17 @@ class DVCBackend:
             sha = self._git(["rev-parse", "--short", "HEAD"])
             return sha.stdout.strip() if sha else None
         except Exception:
-            # It's fine if working tree clean, etc.
             return None
 
     # ---------------------------------------------------------------------
-    # Initialization
+    # Basics / initialization
     # ---------------------------------------------------------------------
-    def initialize_dvc(self, remote_url: Optional[str] = None) -> bool:
-        """
-        Initialize DVC for the project. Creates default data dirs and sets a remote.
+    def _check_dvc_initialized(self) -> bool:
+        return self.dvc_dir.exists() and (self.dvc_dir / "config").exists()
 
-        Returns:
-            True on success.
-        """
-        if not DVC_AVAILABLE or not YAML_AVAILABLE:
+    def initialize_dvc(self, remote_url: Optional[str] = None) -> bool:
+        """Initialize DVC and optionally set a default remote."""
+        if not (DVC_AVAILABLE and YAML_AVAILABLE and self._dvc_cli_ok):
             return False
         try:
             if self.is_initialized:
@@ -162,14 +137,12 @@ class DVCBackend:
             self._dvc(["init"])
             print("✅ DVC initialized")
 
-            # Ensure data dirs exist
             for p in [self.data_dir, self.data_dir / "raw", self.data_dir / "processed", self.data_dir / "external"]:
                 p.mkdir(parents=True, exist_ok=True)
 
             if remote_url:
                 self.add_remote("origin", remote_url, default=True)
 
-            # Create Repo handle
             self.repo = dvc.repo.Repo(str(self.project_root))
             self.is_initialized = True
             self.available = True
@@ -195,9 +168,6 @@ class DVCBackend:
     def track_dataset(self, data_path: str, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """
         Track a dataset/file/dir via `dvc add`. Optionally injects metadata into the .dvc file.
-
-        Returns:
-            Path to the `.dvc` file or None.
         """
         if not self.is_initialized:
             print("⚠️  DVC not initialized; skipping track.")
@@ -209,7 +179,7 @@ class DVCBackend:
             self._dvc(["add", str(path)])
             dvc_file = f"{str(path)}.dvc"
 
-            if metadata and YAML_AVAILABLE:
+            if metadata and YAML_AVAILABLE and Path(dvc_file).exists():
                 self._add_dataset_metadata(dvc_file, metadata)
 
             print(f"📁 Dataset tracked: {path} -> {dvc_file}")
@@ -245,11 +215,9 @@ class DVCBackend:
         git_tag: bool = True,
         push: bool = False,
     ) -> Dict[str, Any]:
-        """
-        Create a dataset version (tracks paths, writes manifest, optional git tag/push).
-        """
+        """Create a dataset version manifest and (optionally) tag/push."""
         if not self.is_initialized:
-            print("⚠️  DVC not initialized; returning a minimal marker.")
+            # Minimal marker for tracker
             return {
                 "experiment_id": experiment_id,
                 "dataset_name": dataset_name,
@@ -270,7 +238,6 @@ class DVCBackend:
         total_size = 0
         file_count = 0
 
-        # Track and accumulate sizes
         for p in data_paths:
             path = Path(p)
             if not path.exists():
@@ -281,8 +248,11 @@ class DVCBackend:
             else:
                 for fp in path.rglob("*"):
                     if fp.is_file():
-                        total_size += fp.stat().st_size
                         file_count += 1
+                        try:
+                            total_size += fp.stat().st_size
+                        except Exception:
+                            pass
             dvc_file = self.track_dataset(
                 p,
                 {
@@ -303,13 +273,13 @@ class DVCBackend:
             "description": description,
             "data_paths": data_paths,
             "dvc_files": dvc_files,
-            "total_size_bytes": total_size,
+            "total_size_bytes": int(total_size),
             "total_size_mb": round(total_size / (1024 * 1024), 2),
-            "file_count": file_count,
+            "file_count": int(file_count),
             "data_hash": self._calculate_dataset_hash(data_paths),
         }
 
-        # Write manifest and track it
+        # Write and track manifest (best-effort)
         try:
             self.data_dir.mkdir(parents=True, exist_ok=True)
             manifest_path = self.data_dir / f"{version_tag}_manifest.json"
@@ -319,7 +289,7 @@ class DVCBackend:
         except Exception as e:
             print(f"⚠️  Could not write/track manifest: {e}")
 
-        # Optionally git tag & push data
+        # Optional git tag + push
         if git_tag:
             self._create_git_tag(version_tag, f"Dataset version: {dataset_name}")
         if push:
@@ -328,32 +298,20 @@ class DVCBackend:
             except Exception:
                 pass
 
-        print(f"📦 Dataset version created: {version_tag} | Files: {file_count}, Size: {version_info['total_size_mb']} MB")
+        print(f"📦 Dataset version: {version_tag} | files={file_count}, size={version_info['total_size_mb']} MB")
         return version_info
 
     def get_active_dataset_version(self, dataset_root: str = "data/") -> Dict[str, Any]:
         """
-        Produce a *fingerprint* of the currently *checked out* dataset state.
-
-        Strategy:
-        - Prefer hashing `dvc.lock` contents (outs' checksums) for stability.
-        - Fall back to hashing all tracked `.dvc` file entries under dataset_root.
-        - Attach current Git commit (short) if available.
-
-        Returns (example):
-            {
-              "version_tag": "lock-c3f9c1a",
-              "lock_hash": "...",
-              "git_commit": "c3f9c1a",
-              "file_count": 1234,
-              "total_size_mb": 456.78,
-              "root": "data/"
-            }
+        Fingerprint of current dataset state:
+        - Prefer `dvc.lock` (stable) → lock_hash
+        - Fallback to hashing all `.dvc` outs under dataset_root
+        - Add current git commit (short), file_count, total_size_mb
         """
         root = Path(dataset_root)
         info: Dict[str, Any] = {"root": str(root)}
 
-        # Helper: current git commit short
+        # git commit (short)
         git_sha_short = None
         try:
             if self._git_is_repo():
@@ -368,10 +326,8 @@ class DVCBackend:
                 with open(lock_path, "r") as f:
                     lock = yaml.safe_load(f) or {}
                 outs = []
-                # dvc.lock structure may differ by DVC version; handle defensively
                 for _, stage in (lock.get("stages", {}) or {}).items():
                     for out in stage.get("outs", []) or []:
-                        # Prefer checksum fields (md5, etag, etc.), else path
                         key = out.get("md5") or out.get("etag") or out.get("hash") or out.get("path")
                         if key:
                             outs.append(str(key))
@@ -387,7 +343,6 @@ class DVCBackend:
             except Exception as e:
                 print(f"⚠️  Could not read dvc.lock: {e}")
 
-        # If we didn’t get a lock hash, fall back to .dvc files under root
         if "version_tag" not in info:
             try:
                 dvc_files = list((root if root.is_absolute() else (self.project_root / root)).rglob("*.dvc"))
@@ -396,7 +351,6 @@ class DVCBackend:
                     try:
                         with open(df, "r") as f:
                             d = yaml.safe_load(f) or {}
-                        # Typical structure: {'outs': [{'md5': '...', 'path': '...'}, ...]}
                         for out in d.get("outs", []) or []:
                             keys.append(out.get("md5") or out.get("etag") or out.get("hash") or out.get("path"))
                     except Exception:
@@ -413,7 +367,7 @@ class DVCBackend:
             except Exception:
                 pass
 
-        # Optional: size and count (best effort)
+        # Size + count (best-effort)
         try:
             total_size = 0
             file_count = 0
@@ -426,7 +380,7 @@ class DVCBackend:
                             total_size += fp.stat().st_size
                         except Exception:
                             pass
-            info["file_count"] = file_count
+            info["file_count"] = int(file_count)
             info["total_size_mb"] = round(total_size / (1024 * 1024), 2)
         except Exception:
             pass
@@ -437,9 +391,7 @@ class DVCBackend:
     # Hash helpers
     # ---------------------------------------------------------------------
     def _calculate_dataset_hash(self, data_paths: List[str]) -> str:
-        """
-        Content hash across provided paths (file bytes + relative names).
-        """
+        """Content hash across provided paths (file bytes + relative names)."""
         hasher = hashlib.sha256()
         try:
             for data_path in sorted(map(str, data_paths)):
@@ -454,7 +406,6 @@ class DVCBackend:
                 else:
                     for fp in sorted(path.rglob("*")):
                         if fp.is_file():
-                            # include relative names for stability
                             try:
                                 rel = str(fp.relative_to(self.project_root))
                             except Exception:
@@ -597,18 +548,19 @@ class DVCBackend:
             return {"error": str(e)}
 
     # ---------------------------------------------------------------------
-    # Version listings / compare / cleanup / export
+    # Versions listing / compare / cleanup / export
     # ---------------------------------------------------------------------
     def list_dataset_versions(self, dataset_name: Optional[str] = None) -> List[Dict[str, Any]]:
         try:
             versions: List[Dict[str, Any]] = []
             pattern = f"{dataset_name}_v*_manifest.json" if dataset_name else "*_manifest.json"
-            for mf in (self.data_dir.glob(pattern) if self.data_dir.exists() else []):
-                try:
-                    with open(mf, "r") as f:
-                        versions.append(json.load(f))
-                except Exception as e:
-                    print(f"⚠️  Could not read {mf}: {e}")
+            if self.data_dir.exists():
+                for mf in self.data_dir.glob(pattern):
+                    try:
+                        with open(mf, "r") as f:
+                            versions.append(json.load(f))
+                    except Exception as e:
+                        print(f"⚠️  Could not read {mf}: {e}")
             versions.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
             return versions
         except Exception as e:
@@ -645,13 +597,14 @@ class DVCBackend:
     def cleanup_old_versions(self, keep_versions: int = 5) -> int:
         try:
             datasets: Dict[str, List[Dict[str, Any]]] = {}
-            for mf in (self.data_dir.glob("*_manifest.json") if self.data_dir.exists() else []):
-                try:
-                    with open(mf, "r") as f:
-                        vi = json.load(f)
-                    datasets.setdefault(vi.get("dataset_name", "unknown"), []).append({"manifest_file": mf, "info": vi})
-                except Exception:
-                    continue
+            if self.data_dir.exists():
+                for mf in self.data_dir.glob("*_manifest.json"):
+                    try:
+                        with open(mf, "r") as f:
+                            vi = json.load(f)
+                        datasets.setdefault(vi.get("dataset_name", "unknown"), []).append({"manifest_file": mf, "info": vi})
+                    except Exception:
+                        continue
             cleaned = 0
             for _, rows in datasets.items():
                 rows.sort(key=lambda x: x["info"].get("timestamp", ""), reverse=True)
@@ -693,7 +646,7 @@ class DVCBackend:
                     "dvc_data": d,
                 })
             with open(output_file, "w") as f:
-                json.dump(export, f, indent=2, default=str)
+                json.dump(export, f, indent=2)
             print(f"📁 Exported dataset info to: {output_file}")
         except Exception as e:
             print(f"❌ Failed to export dataset info: {e}")
@@ -702,9 +655,7 @@ class DVCBackend:
     # Checkout
     # ---------------------------------------------------------------------
     def checkout_dataset_version(self, version_tag: str) -> bool:
-        """
-        Checkout files from a specific dataset version manifest and try git tag.
-        """
+        """Checkout files from a version manifest and try git tag (best-effort)."""
         try:
             mf = self.data_dir / f"{version_tag}_manifest.json"
             if not mf.exists():
@@ -715,7 +666,6 @@ class DVCBackend:
             for dvc_file in info.get("dvc_files", []):
                 if Path(dvc_file).exists():
                     self._dvc(["checkout", dvc_file])
-            # Try git tag checkout (optional)
             if self._git_is_repo():
                 try:
                     self._git(["checkout", version_tag])
@@ -729,7 +679,7 @@ class DVCBackend:
             return False
 
     # ---------------------------------------------------------------------
-    # Cleanup / context mgmt
+    # Cleanup / ctx
     # ---------------------------------------------------------------------
     def close(self) -> None:
         if self.repo:

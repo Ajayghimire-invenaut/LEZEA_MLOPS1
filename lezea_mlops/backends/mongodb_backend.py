@@ -1,18 +1,4 @@
-"""
-MongoDB Backend for LeZeA MLOps
-==============================
-
-Handles storage of complex hierarchical data including:
-- Modification trees and paths
-- Resource usage statistics (per-layer, per-algorithm)
-- Business metrics and costs
-- Experiment metadata and summaries
-- Complex JSON data that doesn't fit well in MLflow
-
-This backend provides optimized storage and querying for LeZeA's
-complex data structures with proper indexing and aggregation capabilities.
-"""
-
+# lezea_mlops/backends/mongodb_backend.py
 from __future__ import annotations
 
 import json
@@ -22,47 +8,45 @@ from typing import Dict, Any, List, Optional, Union, Tuple
 try:
     import pymongo
     from pymongo import MongoClient, ASCENDING, DESCENDING
-    from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
+    from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError, DuplicateKeyError
     MONGODB_AVAILABLE = True
 except ImportError:
     MONGODB_AVAILABLE = False
     pymongo = None  # type: ignore
 
 
+def _scope_min(scope: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Normalize scope to {level, entity_id} (or global)."""
+    if not scope:
+        return {"level": "global", "entity_id": "-"}
+    return {"level": str(scope.get("level", "global")), "entity_id": str(scope.get("entity_id", "-"))}
+
+
 class MongoBackend:
     """
-    MongoDB backend for complex data storage and hierarchical queries
+    MongoDB backend for complex data storage and hierarchical queries.
 
-    This class provides:
-    - Connection management with retry logic
-    - Optimized collections for different data types
-    - Automatic indexing for performance
-    - Aggregation pipelines for analytics
-    - Data validation and cleanup
+    Features:
+    - Connection management with retry-ish timeouts
+    - Optimized collections and compound indexes (scope + step)
+    - Idempotent upserts for high-frequency writes
+    - Aggregation helpers (resource/business)
+    - Optional TTL on noisy collections
     """
 
     def __init__(self, config):
-        """
-        Initialize MongoDB backend
-
-        Args:
-            config: Configuration object with MongoDB settings
-        """
         if not MONGODB_AVAILABLE:
-            raise RuntimeError(
-                "MongoDB is not available. Install with: pip install pymongo"
-            )
+            raise RuntimeError("MongoDB is not available. Install with: pip install pymongo")
 
         self.config = config
         self.mongo_config = config.get_mongodb_config()
 
-        # Initialize connection
+        # Connection
         self.client: Optional[MongoClient] = None
         self.database = None
         self.collections: Dict[str, Any] = {}
         self.available: bool = False
 
-        # Connect and setup
         self._connect()
         self._setup_collections()
         self._create_indexes()
@@ -74,7 +58,7 @@ class MongoBackend:
     # Connection & setup
     # ---------------------------------------------------------------------
     def _connect(self) -> None:
-        """Establish connection to MongoDB with retry logic"""
+        """Establish connection to MongoDB with sane timeouts."""
         try:
             self.client = MongoClient(
                 self.mongo_config["connection_string"],
@@ -84,61 +68,92 @@ class MongoBackend:
                 retryWrites=True,
                 w="majority",
             )
-            # Test the connection
             self.client.admin.command("ping")
-            # Get database
             self.database = self.client[self.mongo_config["database"]]
         except (ConnectionFailure, ServerSelectionTimeoutError) as e:
             raise ConnectionError(f"Failed to connect to MongoDB: {e}")
 
     def _setup_collections(self) -> None:
-        """Setup collections with proper configuration"""
+        """Bind collection handles with configurable names."""
         coll_cfg = self.mongo_config.get("collections", {})
-        # Expected keys: experiments, modifications, resources, business, datasets
-        for key in ("experiments", "modifications", "resources", "business", "datasets"):
-            name = coll_cfg.get(key, key)
+        # canonical names -> mongo collection names
+        names = {
+            "experiments": coll_cfg.get("experiments", "experiments"),
+            "modifications": coll_cfg.get("modifications", "modifications"),
+            "resources": coll_cfg.get("resources", "resources"),
+            "business": coll_cfg.get("business", "business"),
+            "datasets": coll_cfg.get("datasets", "datasets"),
+            "rollups":  coll_cfg.get("rollups",  "rollups"),  # new: scope/time rollups
+        }
+        for key, name in names.items():
             self.collections[key] = self.database[name]
 
     def _create_indexes(self) -> None:
-        """Create indexes for optimal query performance"""
+        """Create indexes for optimal query performance and idempotency."""
         try:
-            # Experiments collection indexes (do NOT make experiment_id unique;
-            # we store many docs per experiment_id with different 'type's)
-            if "experiments" in self.collections:
-                exp = self.collections["experiments"]
-                exp.create_index([("experiment_id", ASCENDING), ("type", ASCENDING), ("timestamp", DESCENDING)])
-                exp.create_index([("timestamp", DESCENDING)])
-                exp.create_index([("metadata.name", ASCENDING)])  # from store_experiment_metadata
-                exp.create_index([("summary.status", ASCENDING)], sparse=True)
+            # Experiments: general event stream (results, metadata, summaries)
+            exp = self.collections["experiments"]
+            exp.create_index([("experiment_id", ASCENDING), ("type", ASCENDING), ("timestamp", DESCENDING)])
+            exp.create_index([("timestamp", DESCENDING)])
+            exp.create_index([("metadata.name", ASCENDING)], sparse=True)  # from store_experiment_metadata
+            exp.create_index([("summary.status", ASCENDING)], sparse=True)
+            # Idempotent summaries: one per experiment
+            exp.create_index([("experiment_id", ASCENDING), ("type", ASCENDING)], name="exp_type_unique", unique=False)
 
-            # Modifications collection indexes
-            if "modifications" in self.collections:
-                mod = self.collections["modifications"]
-                mod.create_index([("experiment_id", ASCENDING), ("step_data.step", ASCENDING)])
-                mod.create_index([("experiment_id", ASCENDING), ("modification_data.step", ASCENDING)])
-                mod.create_index([("timestamp", DESCENDING)])
-                mod.create_index([("experiment_id", ASCENDING), ("timestamp", DESCENDING)])
+            # Modifications: includes training steps and mod trees
+            mod = self.collections["modifications"]
+            # Upsert key for steps: experiment + type + step + scope
+            mod.create_index(
+                [("experiment_id", ASCENDING), ("type", ASCENDING),
+                 ("step_data.step", ASCENDING), ("step_data.scope.level", ASCENDING),
+                 ("step_data.scope.entity_id", ASCENDING)],
+                name="step_scope_unique",
+                unique=True,
+                partialFilterExpression={"type": "training_step"},
+            )
+            # Upsert key for mod trees by step + scope (optional)
+            mod.create_index(
+                [("experiment_id", ASCENDING), ("type", ASCENDING),
+                 ("modification_data.step", ASCENDING), ("modification_data.scope.level", ASCENDING),
+                 ("modification_data.scope.entity_id", ASCENDING)],
+                name="modtree_step_scope_unique",
+                unique=True,
+                partialFilterExpression={"type": "modification_tree"},
+            )
+            mod.create_index([("timestamp", DESCENDING)])
+            mod.create_index([("experiment_id", ASCENDING), ("timestamp", DESCENDING)])
 
-            # Resources collection indexes
-            if "resources" in self.collections:
-                res = self.collections["resources"]
-                res.create_index([("experiment_id", ASCENDING)])
-                res.create_index([("resource_data.component_type", ASCENDING)])
-                res.create_index([("timestamp", DESCENDING)])
+            # Resources: raw samples (optionally TTL) + component queries
+            res = self.collections["resources"]
+            res.create_index([("experiment_id", ASCENDING), ("timestamp", DESCENDING)])
+            res.create_index([("resource_data.component_type", ASCENDING)])
+            # Optional TTL for raw samples (configure in config: resources_ttl_days)
+            ttl_days = int(self.mongo_config.get("resources_ttl_days", 0) or 0)
+            if ttl_days > 0:
+                try:
+                    res.create_index(
+                        [("timestamp", ASCENDING)],
+                        expireAfterSeconds=ttl_days * 24 * 3600,
+                        name="resources_ttl",
+                    )
+                except Exception:
+                    pass
 
-            # Business collection indexes
-            if "business" in self.collections:
-                bus = self.collections["business"]
-                bus.create_index([("experiment_id", ASCENDING)])
-                bus.create_index([("business_data.cost", DESCENDING)])
-                bus.create_index([("timestamp", DESCENDING)])
+            # Business
+            bus = self.collections["business"]
+            bus.create_index([("experiment_id", ASCENDING), ("timestamp", DESCENDING)])
+            bus.create_index([("business_data.cost", DESCENDING)])
 
-            # Datasets collection indexes
-            if "datasets" in self.collections:
-                ds = self.collections["datasets"]
-                ds.create_index([("experiment_id", ASCENDING), ("type", ASCENDING), ("timestamp", DESCENDING)])
-                ds.create_index([("dataset_name", ASCENDING)], sparse=True)
-                ds.create_index([("timestamp", DESCENDING)])
+            # Datasets
+            ds = self.collections["datasets"]
+            ds.create_index([("experiment_id", ASCENDING), ("type", ASCENDING), ("timestamp", DESCENDING)])
+            ds.create_index([("dataset_name", ASCENDING)], sparse=True)
+
+            # Rollups (scope/time buckets)
+            roll = self.collections["rollups"]
+            roll.create_index([("experiment_id", ASCENDING), ("scope.level", ASCENDING),
+                               ("scope.entity_id", ASCENDING), ("bucket", ASCENDING)],
+                              name="rollup_scope_bucket", unique=True)
 
             print("📊 MongoDB indexes created")
         except Exception as e:
@@ -155,10 +170,10 @@ class MongoBackend:
             return False
 
     # ---------------------------------------------------------------------
-    # Stores
+    # Stores (idempotent where it matters)
     # ---------------------------------------------------------------------
     def store_experiment_metadata(self, experiment_id: str, metadata: Dict[str, Any]) -> Optional[str]:
-        """Store experiment metadata into 'experiments'."""
+        """Append experiment metadata (non-unique stream)."""
         try:
             document = {
                 "experiment_id": experiment_id,
@@ -174,7 +189,7 @@ class MongoBackend:
             return None
 
     def store_lezea_config(self, experiment_id: str, lezea_config: Dict[str, Any]) -> Optional[str]:
-        """Store LeZeA configuration into 'experiments'."""
+        """Append LeZeA configuration (versioned over time)."""
         try:
             document = {
                 "experiment_id": experiment_id,
@@ -190,38 +205,100 @@ class MongoBackend:
             return None
 
     def store_modification_tree(self, experiment_id: str, modification_data: Dict[str, Any]) -> Optional[str]:
-        """Store model modification tree into 'modifications'."""
+        """
+        Store model modification tree.
+        If 'step' is present, we upsert by (experiment_id, type, step, scope).
+        """
         try:
-            document = {
+            coll = self.collections["modifications"]
+            scope = _scope_min(modification_data.get("scope"))
+            step = modification_data.get("step")
+            doc = {
                 "experiment_id": experiment_id,
                 "timestamp": datetime.now(),
-                "modification_data": modification_data,
+                "modification_data": {**modification_data, "scope": scope},
                 "type": "modification_tree",
             }
-            result = self.collections["modifications"].insert_one(document)
-            print(f"🌳 Stored modification tree: {experiment_id}")
-            return str(result.inserted_id)
+            if step is not None:
+                filt = {
+                    "experiment_id": experiment_id,
+                    "type": "modification_tree",
+                    "modification_data.step": step,
+                    "modification_data.scope.level": scope["level"],
+                    "modification_data.scope.entity_id": scope["entity_id"],
+                }
+                coll.update_one(filt, {"$set": doc}, upsert=True)
+                return "upserted"
+            else:
+                result = coll.insert_one(doc)
+                return str(result.inserted_id)
+        except DuplicateKeyError:
+            # Rare race: replace on duplicate
+            try:
+                coll = self.collections["modifications"]
+                scope = _scope_min(modification_data.get("scope"))
+                step = modification_data.get("step")
+                filt = {
+                    "experiment_id": experiment_id,
+                    "type": "modification_tree",
+                    "modification_data.step": step,
+                    "modification_data.scope.level": scope["level"],
+                    "modification_data.scope.entity_id": scope["entity_id"],
+                }
+                coll.replace_one(filt, {
+                    "experiment_id": experiment_id,
+                    "timestamp": datetime.now(),
+                    "modification_data": {**modification_data, "scope": scope},
+                    "type": "modification_tree",
+                }, upsert=True)
+                return "replaced"
+            except Exception:
+                return None
         except Exception as e:
             print(f"❌ Failed to store modification tree: {e}")
             return None
 
     def store_training_step(self, experiment_id: str, step_data: Dict[str, Any]) -> Optional[str]:
-        """Store training step data (kept alongside modifications)."""
+        """
+        Idempotent store of training step:
+        unique key: (experiment_id, type='training_step', step, scope.level, scope.entity_id)
+        """
         try:
-            document = {
+            coll = self.collections["modifications"]
+            scope = _scope_min(step_data.get("scope"))
+            step = step_data.get("step")
+            if step is None:
+                # Fallback: append-only
+                doc = {
+                    "experiment_id": experiment_id,
+                    "timestamp": datetime.now(),
+                    "step_data": {**step_data, "scope": scope},
+                    "type": "training_step",
+                }
+                result = coll.insert_one(doc)
+                return str(result.inserted_id)
+
+            filt = {
+                "experiment_id": experiment_id,
+                "type": "training_step",
+                "step_data.step": step,
+                "step_data.scope.level": scope["level"],
+                "step_data.scope.entity_id": scope["entity_id"],
+            }
+            doc = {
                 "experiment_id": experiment_id,
                 "timestamp": datetime.now(),
-                "step_data": step_data,
+                "step_data": {**step_data, "scope": scope},
                 "type": "training_step",
             }
-            result = self.collections["modifications"].insert_one(document)
-            return str(result.inserted_id)
+            coll.update_one(filt, {"$set": doc}, upsert=True)
+            return "upserted"
         except Exception as e:
             print(f"❌ Failed to store training step: {e}")
             return None
 
     def store_resource_usage(self, experiment_id: str, resource_data: Dict[str, Any]) -> Optional[str]:
-        """Store resource usage data into 'resources'."""
+        """Append resource usage sample."""
         try:
             document = {
                 "experiment_id": experiment_id,
@@ -235,8 +312,32 @@ class MongoBackend:
             print(f"❌ Failed to store resource usage: {e}")
             return None
 
+    def upsert_scope_rollup(self, experiment_id: str, scope: Dict[str, Any], bucket: str, values: Dict[str, Any]) -> None:
+        """
+        Upsert summarized resource metrics per scope/time bucket.
+        `bucket` example: '2025-08-10T10:05Z' or '5m_2025-08-10_10:05'
+        """
+        try:
+            scope_n = _scope_min(scope)
+            filt = {
+                "experiment_id": experiment_id,
+                "scope.level": scope_n["level"],
+                "scope.entity_id": scope_n["entity_id"],
+                "bucket": bucket,
+            }
+            doc = {
+                "experiment_id": experiment_id,
+                "timestamp": datetime.now(),
+                "scope": scope_n,
+                "bucket": bucket,
+                "values": values,
+            }
+            self.collections["rollups"].update_one(filt, {"$set": doc}, upsert=True)
+        except Exception as e:
+            print(f"❌ Failed to upsert scope rollup: {e}")
+
     def store_business_metrics(self, experiment_id: str, business_data: Dict[str, Any]) -> Optional[str]:
-        """Store business metrics/cost data into 'business'."""
+        """Append business metrics/cost data."""
         try:
             document = {
                 "experiment_id": experiment_id,
@@ -251,12 +352,9 @@ class MongoBackend:
             print(f"❌ Failed to store business metrics: {e}")
             return None
 
-    # ---- NEW: Data split & dataset version & generic results ----------------
+    # ---- Data split & dataset version & generic results ----------------
     def store_data_splits(self, experiment_id: str, payload: Dict[str, Any]) -> Optional[str]:
-        """
-        Store data split counts and metadata.
-        Collection: datasets | type: data_splits
-        """
+        """Append data split counts and metadata."""
         try:
             document = {
                 "experiment_id": experiment_id,
@@ -272,10 +370,7 @@ class MongoBackend:
             return None
 
     def store_dataset_version(self, experiment_id: str, dataset_name: str, info: Dict[str, Any]) -> Optional[str]:
-        """
-        Store dataset version/fingerprint info.
-        Collection: datasets | type: dataset_version
-        """
+        """Append dataset version/fingerprint info."""
         try:
             document = {
                 "experiment_id": experiment_id,
@@ -294,42 +389,53 @@ class MongoBackend:
     def store_results(self, experiment_id: str, payload: Dict[str, Any]) -> Optional[str]:
         """
         Store result events (tasker/builder rewards, RL episode, classification, generation, summaries).
-        Collection: experiments | type: payload['kind'] or 'result_event'
+        If payload has 'step' and 'scope', we upsert on (exp, type, step, scope).
         """
         try:
-            document = {
+            coll = self.collections["experiments"]
+            kind = payload.get("kind", "result_event")
+            scope = _scope_min(payload.get("scope"))
+            step = payload.get("step", None)
+
+            doc = {
                 "experiment_id": experiment_id,
                 "timestamp": datetime.now(),
-                "type": payload.get("kind", "result_event"),
+                "type": kind,
                 **payload,
+                "scope": scope,
             }
-            result = self.collections["experiments"].insert_one(document)
-            return str(result.inserted_id)
+
+            if step is not None:
+                filt = {
+                    "experiment_id": experiment_id,
+                    "type": kind,
+                    "step": step,
+                    "scope.level": scope["level"],
+                    "scope.entity_id": scope["entity_id"],
+                }
+                coll.update_one(filt, {"$set": doc}, upsert=True)
+                return "upserted"
+            else:
+                result = coll.insert_one(doc)
+                return str(result.inserted_id)
         except Exception as e:
             print(f"❌ Failed to store results: {e}")
             return None
 
     def store_experiment_summary(self, experiment_id: str, summary: Dict[str, Any]) -> Optional[str]:
-        """Upsert final experiment summary into 'experiments'."""
+        """Upsert final experiment summary (one doc per experiment)."""
         try:
-            existing = self.collections["experiments"].find_one(
-                {"experiment_id": experiment_id, "type": "experiment_summary"}
-            )
-            document = {
+            coll = self.collections["experiments"]
+            filt = {"experiment_id": experiment_id, "type": "experiment_summary"}
+            doc = {
                 "experiment_id": experiment_id,
                 "timestamp": datetime.now(),
                 "summary": summary,
                 "type": "experiment_summary",
             }
-            if existing:
-                self.collections["experiments"].replace_one({"_id": existing["_id"]}, document)
-                doc_id = str(existing["_id"])
-                print(f"📊 Updated experiment summary: {experiment_id}")
-            else:
-                result = self.collections["experiments"].insert_one(document)
-                doc_id = str(result.inserted_id)
-                print(f"📊 Stored experiment summary: {experiment_id}")
-            return doc_id
+            coll.update_one(filt, {"$set": doc}, upsert=True)
+            print(f"📊 Upserted experiment summary: {experiment_id}")
+            return "upserted"
         except Exception as e:
             print(f"❌ Failed to store experiment summary: {e}")
             return None
@@ -348,7 +454,7 @@ class MongoBackend:
             for collection_name, collection in self.collections.items():
                 cursor = collection.find(query).sort("timestamp", DESCENDING)
                 for doc in cursor:
-                    doc["_id"] = str(doc["_id"])
+                    doc["_id"] = str(doc.get("_id", ""))
                     doc["collection"] = collection_name
                     results.append(doc)
             return results
@@ -365,7 +471,7 @@ class MongoBackend:
             cursor = self.collections["modifications"].find(query).sort("timestamp", ASCENDING)
             mods: List[Dict[str, Any]] = []
             for doc in cursor:
-                doc["_id"] = str(doc["_id"])
+                doc["_id"] = str(doc.get("_id", ""))
                 mods.append(doc)
             return mods
         except Exception as e:
@@ -381,7 +487,7 @@ class MongoBackend:
             cursor = self.collections["resources"].find(query).sort("timestamp", ASCENDING)
             out: List[Dict[str, Any]] = []
             for doc in cursor:
-                doc["_id"] = str(doc["_id"])
+                doc["_id"] = str(doc.get("_id", ""))
                 out.append(doc)
             return out
         except Exception as e:
@@ -463,7 +569,7 @@ class MongoBackend:
             cursor = self.collections["experiments"].find(q).limit(limit).sort("timestamp", DESCENDING)
             out: List[Dict[str, Any]] = []
             for doc in cursor:
-                doc["_id"] = str(doc["_id"])
+                doc["_id"] = str(doc.get("_id", ""))
                 out.append(doc)
             return out
         except Exception as e:
@@ -510,7 +616,7 @@ class MongoBackend:
             for name, coll in self.collections.items():
                 docs = list(coll.find({"experiment_id": experiment_id}))
                 for d in docs:
-                    d["_id"] = str(d["_id"])
+                    d["_id"] = str(d.get("_id", ""))
                 export_data["collections"][name] = docs
             with open(output_file, "w") as f:
                 json.dump(export_data, f, indent=2, default=str)
@@ -558,7 +664,7 @@ class MongoBackend:
                     query["experiment_id"] = {"$in": experiment_ids}
                 docs = list(coll.find(query))
                 for d in docs:
-                    d["_id"] = str(d["_id"])
+                    d["_id"] = str(d.get("_id", ""))
                 backup["collections"][name] = docs
             with open(backup_file, "w") as f:
                 json.dump(backup, f, indent=2, default=str)
@@ -571,7 +677,7 @@ class MongoBackend:
     # Lifecycle
     # ---------------------------------------------------------------------
     def close(self) -> None:
-        """Close MongoDB connection"""
+        """Close MongoDB connection."""
         if self.client:
             self.client.close()
             print("🔌 MongoDB connection closed")

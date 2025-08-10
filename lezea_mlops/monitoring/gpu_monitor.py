@@ -1,33 +1,15 @@
-"""
-GPU Monitor for LeZeA MLOps — FINAL
-===================================
-
-- Real-time GPU + system metrics (multi-GPU)
-- Auto-fallback: GPUtil → NVML → torch (any/none ok)
-- Thread-safe background sampler with ring buffers
-- Bottleneck detection + lightweight recommendations
-- Optional Prometheus exporter (if prometheus_client installed)
-- Tracker-friendly snapshot keys:
-  top-level: cpu_percent, memory_mb (sum GPU), gpu_util_percent (avg), device_count
-
-Public API used by your tracker:
-- start_monitoring(experiment_id: str|None)
-- stop_monitoring()
-- get_current_usage()  -> includes top-level summary keys
-- get_usage_history(minutes=10)
-- get_performance_summary()
-- get_optimization_recommendations()
-- export_monitoring_data(filepath, include_history=True)
-"""
+# lezea_mlops/monitoring/gpu_monitor.py
+# GPU Monitor for LeZeA MLOps — hardened & tracker-aligned
 
 from __future__ import annotations
 
 import time
 import threading
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 from collections import deque
 import json
+import os
 
 # Optional deps
 GPU_LIBRARIES: List[str] = []
@@ -36,26 +18,26 @@ try:
     import GPUtil  # type: ignore
     GPU_LIBRARIES.append("GPUtil")
 except Exception:
-    GPUtil = None
+    GPUtil = None  # type: ignore
 
 try:
     import pynvml  # type: ignore
     GPU_LIBRARIES.append("pynvml")
 except Exception:
-    pynvml = None
+    pynvml = None  # type: ignore
 
 try:
     import torch  # type: ignore
     if torch.cuda.is_available():
         GPU_LIBRARIES.append("torch")
 except Exception:
-    torch = None
+    torch = None  # type: ignore
 
 try:
     import psutil  # type: ignore
     PSUTIL_AVAILABLE = True
 except Exception:
-    psutil = None
+    psutil = None  # type: ignore
     PSUTIL_AVAILABLE = False
 
 try:
@@ -92,7 +74,7 @@ class GPUMonitor:
         # Monitoring state
         self.is_monitoring = False
         self.monitor_thread: Optional[threading.Thread] = None
-        self.experiment_id: Optional[str] = None
+        self.experiment_id: Optional[None | str] = None
 
         # Data buffers
         self._lock = threading.Lock()
@@ -103,6 +85,16 @@ class GPUMonitor:
         # Prometheus
         self._prom_registry: Optional[CollectorRegistry] = None
         self._prom_started = False
+        # Gauges will be defined lazily when Prometheus starts
+        self.g_gpu_util = None
+        self.g_gpu_mem_used = None
+        self.g_gpu_mem_pct = None
+        self.g_gpu_temp = None
+        self.g_sys_cpu = None
+        self.g_sys_mem = None
+        # Data-usage gauges (Grafana-friendly)
+        self.g_du_usage_rate = None
+        self.g_du_gini = None
 
         self._detect_gpus()
 
@@ -232,6 +224,10 @@ class GPUMonitor:
                 pass
         print("📊 Stopped GPU monitoring")
 
+    # Simple health hook (not used by tracker health, but handy)
+    def ping(self) -> bool:
+        return True  # lightweight; monitoring is optional
+
     # ---------------------------
     # Prometheus (optional)
     # ---------------------------
@@ -245,6 +241,20 @@ class GPUMonitor:
             self.g_gpu_temp = Gauge("lezea_gpu_temperature_c", "GPU temperature (C)", ["gpu_id"], registry=self._prom_registry)
             self.g_sys_cpu = Gauge("lezea_system_cpu_percent", "System CPU percent", registry=self._prom_registry)
             self.g_sys_mem = Gauge("lezea_system_memory_percent", "System memory percent", registry=self._prom_registry)
+
+            # Data-usage gauges (per split)
+            self.g_du_usage_rate = Gauge(
+                "lezea_data_usage_rate",
+                "Unique coverage rate of a split (unique_seen/total)",
+                ["split"],
+                registry=self._prom_registry,
+            )
+            self.g_du_gini = Gauge(
+                "lezea_data_usage_gini",
+                "Gini coefficient of per-sample exposure distribution (split)",
+                ["split"],
+                registry=self._prom_registry,
+            )
 
             start_http_server(port, registry=self._prom_registry)
             self._prom_started = True
@@ -260,19 +270,35 @@ class GPUMonitor:
         try:
             for m in gpu_metrics:
                 gpu_id = str(m.get("device_id", -1))
-                if "utilization_percent" in m:
+                if "utilization_percent" in m and self.g_gpu_util:
                     self.g_gpu_util.labels(gpu_id).set(m["utilization_percent"])
-                if "memory_used_mb" in m:
+                if "memory_used_mb" in m and self.g_gpu_mem_used:
                     self.g_gpu_mem_used.labels(gpu_id).set(m["memory_used_mb"])
-                if "memory_percent" in m:
+                if "memory_percent" in m and self.g_gpu_mem_pct:
                     self.g_gpu_mem_pct.labels(gpu_id).set(m["memory_percent"])
-                if "temperature_c" in m:
+                if "temperature_c" in m and isinstance(m["temperature_c"], (int, float)) and self.g_gpu_temp:
                     self.g_gpu_temp.labels(gpu_id).set(m["temperature_c"])
-            if "cpu_percent" in sys_metrics:
+            if "cpu_percent" in sys_metrics and self.g_sys_cpu:
                 self.g_sys_cpu.set(sys_metrics["cpu_percent"])
-            if "memory_percent" in sys_metrics:
+            if "memory_percent" in sys_metrics and self.g_sys_mem:
                 self.g_sys_mem.set(sys_metrics["memory_percent"])
         except Exception:
+            pass
+
+    def update_data_usage_metrics(self, split: str, usage_rate: Optional[float], gini: Optional[float]) -> None:
+        """
+        Lightweight hook used by the tracker to push per-split data-usage stats
+        into the same Prometheus exporter as GPU/system metrics.
+        """
+        if not self._prom_started:
+            return
+        try:
+            if isinstance(usage_rate, (int, float)) and self.g_du_usage_rate:
+                self.g_du_usage_rate.labels(str(split)).set(float(usage_rate))
+            if isinstance(gini, (int, float)) and self.g_du_gini:
+                self.g_du_gini.labels(str(split)).set(float(gini))
+        except Exception:
+            # Never break training loop because of metrics push
             pass
 
     # ---------------------------
@@ -396,7 +422,6 @@ class GPUMonitor:
                     "memory_used_mb": round(mem_used / (1024 ** 2), 1),
                     "memory_percent": round(mem_pct, 1),
                 }
-                # Utilization is not generally available in torch; skip unless present
                 out.append(row)
             except Exception as e:
                 print(f"⚠️ Torch metrics failed for GPU {i}: {e}")
@@ -413,15 +438,26 @@ class GPUMonitor:
                 load1, load5, load15 = psutil.getloadavg()
             except Exception:
                 load1 = load5 = load15 = 0.0
+            # disk I/O (best effort; cumulative since boot)
+            io_read_bytes = io_write_bytes = 0
+            try:
+                dio = psutil.disk_io_counters()
+                if dio:
+                    io_read_bytes = int(getattr(dio, "read_bytes", 0))
+                    io_write_bytes = int(getattr(dio, "write_bytes", 0))
+            except Exception:
+                pass
             return {
-                "cpu_percent": cpu_percent,
-                "cpu_count": cpu_count,
-                "memory_percent": mem.percent,
+                "cpu_percent": float(cpu_percent),
+                "cpu_count": int(cpu_count) if cpu_count else None,
+                "memory_percent": float(mem.percent),
                 "memory_used_gb": round(mem.used / (1024 ** 3), 2),
                 "memory_total_gb": round(mem.total / (1024 ** 3), 2),
-                "load_avg_1m": load1,
-                "load_avg_5m": load5,
-                "load_avg_15m": load15,
+                "load_avg_1m": float(load1),
+                "load_avg_5m": float(load5),
+                "load_avg_15m": float(load15),
+                "io_read_bytes": io_read_bytes,
+                "io_write_bytes": io_write_bytes,
             }
         except Exception as e:
             print(f"⚠️ System metrics failed: {e}")
@@ -479,7 +515,11 @@ class GPUMonitor:
           - cpu_percent (system)
           - memory_mb (sum of GPU used MB)
           - gpu_util_percent (avg across devices if available)
-          - device_count
+          - gpu_count (alias for device_count)
+          - gpu_memory_mb (alias of memory_mb)
+          - util (alias of gpu_util_percent)
+          - ram_gb (system total RAM in GB)
+          - io_read_bytes / io_write_bytes (cumulative, best-effort)
         """
         try:
             g = self._collect_gpu_metrics()
@@ -494,7 +534,7 @@ class GPUMonitor:
                     util_vals.append(float(m["utilization_percent"]))
             avg_util = sum(util_vals) / len(util_vals) if util_vals else 0.0
 
-            return {
+            snapshot = {
                 "timestamp": datetime.now().isoformat(),
                 "gpu_devices": g,
                 "system": s,
@@ -504,6 +544,19 @@ class GPUMonitor:
                 "memory_mb": round(total_gpu_mem_mb, 2),
                 "gpu_util_percent": round(avg_util, 2),
             }
+
+            # Aliases for tracker/cost_model compatibility
+            snapshot["gpu_count"] = snapshot["device_count"]
+            snapshot["util"] = snapshot["gpu_util_percent"]
+            snapshot["gpu_memory_mb"] = snapshot["memory_mb"]
+            if "memory_total_gb" in s:
+                snapshot["ram_gb"] = float(s["memory_total_gb"])
+            if "io_read_bytes" in s:
+                snapshot["io_read_bytes"] = int(s["io_read_bytes"])
+            if "io_write_bytes" in s:
+                snapshot["io_write_bytes"] = int(s["io_write_bytes"])
+
+            return snapshot
         except Exception as e:
             print(f"❌ Snapshot failed: {e}")
             return {}
@@ -528,10 +581,7 @@ class GPUMonitor:
         try:
             with self._lock:
                 if not self.gpu_history:
-                    # Still include system part
-                    sys_sum = {}
-                    if self.system_history:
-                        sys_sum = self.system_history[-1]["metrics"]
+                    sys_sum = self.system_history[-1]["metrics"] if self.system_history else {}
                     return {"error": "No GPU samples yet", "system": sys_sum}
 
                 gpu_stats: Dict[int, Dict[str, List[float]]] = {}

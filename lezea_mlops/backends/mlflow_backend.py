@@ -1,21 +1,7 @@
-"""
-MLflow Backend for LeZeA MLOps — UPDATED
-=======================================
-
-Adds reliability and spec-aligned helpers:
-- Safe experiment creation + connection checks
-- Run lifecycle (parent/child runs supported via context manager)
-- Robust params/metrics/tags logging with type/length guards
-- Correct dictionary/text/figure artifact logging
-- Artifact helpers (files/dirs)
-- URLs for run/experiment
-- Experiment summary utilities
-- Health check ping() and availability flag
-"""
+# lezea_mlops/backends/mlflow_backend.py
 from __future__ import annotations
 
 import os
-import io
 import json
 import tempfile
 from contextlib import contextmanager
@@ -25,22 +11,26 @@ from typing import Any, Dict, List, Optional, Union
 
 try:
     import mlflow
-    from mlflow.exceptions import MlflowException
     from mlflow.tracking import MlflowClient
     MLFLOW_AVAILABLE = True
 except Exception:  # pragma: no cover — environment guard
     mlflow = None
     MlflowClient = None
-    MlflowException = Exception
     MLFLOW_AVAILABLE = False
 
 
-class MLflowBackend:
-    """Thin wrapper around MLflow for LeZeA.
+def _stringify(value: Any, max_len: int = 500) -> str:
+    if isinstance(value, (dict, list)):
+        s = json.dumps(value)
+    elif value is None:
+        s = "null"
+    else:
+        s = str(value)
+    return s if len(s) <= max_len else (s[: max_len - 3] + "...")
 
-    Exposes a stable API the tracker can rely on even if some MLflow
-    features differ across versions.
-    """
+
+class MLflowBackend:
+    """Thin, stable wrapper around MLflow for LeZeA."""
 
     def __init__(self, config) -> None:
         if not MLFLOW_AVAILABLE:
@@ -70,13 +60,12 @@ class MLflowBackend:
     # ------------------------------------------------------------------
     def _verify_connection(self) -> None:
         try:
-            # If server is reachable, this should succeed without auth issues
+            # If server is reachable, this should succeed
             _ = mlflow.search_experiments(max_results=1)
-        except Exception as e:  # pragma: no cover — defensive
+        except Exception as e:  # pragma: no cover
             raise ConnectionError(f"Failed to connect to MLflow: {e}")
 
     def ping(self) -> bool:
-        """Health check used by the tracker."""
         try:
             _ = mlflow.search_experiments(max_results=1)
             return True
@@ -90,14 +79,14 @@ class MLflowBackend:
         artifact_location: Optional[str] = None,
         tags: Optional[Dict[str, str]] = None,
     ) -> str:
-        """Create (or reuse) an experiment and mark it current."""
+        """Create or reuse an experiment and mark it as current."""
         try:
             exp = mlflow.get_experiment_by_name(experiment_name)
             if exp is None:
                 mlflow_experiment_id = mlflow.create_experiment(
                     name=experiment_name,
                     artifact_location=artifact_location or self.mlflow_config.get("default_artifact_root"),
-                    tags=tags,
+                    tags={k: _stringify(v) for k, v in (tags or {}).items()} or None,
                 )
                 print(f"📁 Created MLflow experiment: {experiment_name} (ID: {mlflow_experiment_id})")
             else:
@@ -108,7 +97,7 @@ class MLflowBackend:
             self.current_experiment = experiment_name
             self.current_experiment_id = mlflow_experiment_id
 
-            # Stash LeZeA tags to apply to runs (experiment tags API not universal)
+            # Stash tags for subsequent runs and try to write as experiment tags
             self._add_experiment_tags(mlflow_experiment_id, lezea_experiment_id, tags)
             return mlflow_experiment_id
         except Exception as e:  # pragma: no cover
@@ -126,15 +115,14 @@ class MLflowBackend:
                 "creation_timestamp": datetime.now().isoformat(),
             }
             if additional_tags:
-                base.update({str(k): str(v) for k, v in additional_tags.items()})
-            # Keep for next start_run (works across MLflow versions)
+                base.update({str(k): _stringify(v) for k, v in additional_tags.items()})
             self._pending_experiment_tags.update(base)
 
-            # Best-effort: set experiment tags when supported
+            # Best-effort: set experiment tags when server allows it
             try:
                 client = MlflowClient()
                 for k, v in base.items():
-                    client.set_experiment_tag(self.current_experiment_id, k, str(v))
+                    client.set_experiment_tag(mlflow_experiment_id, k, str(v))
             except Exception:
                 pass
         except Exception as e:  # pragma: no cover
@@ -145,6 +133,11 @@ class MLflowBackend:
     # ------------------------------------------------------------------
     def start_run(self, run_name: Optional[str] = None, tags: Optional[Dict[str, str]] = None, nested: bool = False) -> str:
         try:
+            if self.current_run is not None:
+                # Idempotency: don't silently stack runs
+                print("ℹ️ Ending previous active run before starting a new one")
+                self.end_run(status="FINISHED")
+
             run_tags = {
                 "mlflow.runName": run_name or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
                 "lezea.created_by": "lezea_mlops",
@@ -153,7 +146,7 @@ class MLflowBackend:
             if self._pending_experiment_tags:
                 run_tags.update(self._pending_experiment_tags)
             if tags:
-                run_tags.update({str(k): str(v) for k, v in tags.items()})
+                run_tags.update({str(k): _stringify(v) for k, v in tags.items()})
 
             run = mlflow.start_run(run_name=run_name, tags=run_tags, nested=nested)
             self.current_run = run
@@ -169,7 +162,11 @@ class MLflowBackend:
             if self.current_run is None:
                 print("⚠️ No active run to end")
                 return
-            self.log_metric("run_end_timestamp", datetime.now().timestamp())
+            # put an end timestamp metric for convenience
+            try:
+                self.log_metric("run_end_timestamp", datetime.now().timestamp())
+            except Exception:
+                pass
             mlflow.end_run(status=status)
             print(f"🏁 Ended MLflow run with status: {status}")
         finally:
@@ -186,36 +183,17 @@ class MLflowBackend:
             self.end_run(status="FINISHED")
 
     # ------------------------------------------------------------------
-    # Logging helpers
+    # Logging helpers (guarded + portable)
     # ------------------------------------------------------------------
     def log_param(self, key: str, value: Any) -> None:
         try:
-            v: str
-            if isinstance(value, (dict, list)):
-                v = json.dumps(value)
-            elif value is None:
-                v = "null"
-            else:
-                v = str(value)
-            if len(v) > 500:
-                v = v[:497] + "..."
-            mlflow.log_param(key, v)
+            mlflow.log_param(key, _stringify(value))
         except Exception as e:  # pragma: no cover
             print(f"❌ Failed to log param {key}: {e}")
 
     def log_params(self, params: Dict[str, Any]) -> None:
         try:
-            processed = {}
-            for k, v in params.items():
-                if isinstance(v, (dict, list)):
-                    val = json.dumps(v)
-                elif v is None:
-                    val = "null"
-                else:
-                    val = str(v)
-                if len(val) > 500:
-                    val = val[:497] + "..."
-                processed[k] = val
+            processed = {k: _stringify(v) for k, v in params.items()}
             if processed:
                 mlflow.log_params(processed)
                 print(f"📝 Logged {len(processed)} parameters")
@@ -225,7 +203,7 @@ class MLflowBackend:
     def log_metric(self, key: str, value: Union[int, float], step: Optional[int] = None) -> None:
         try:
             if not isinstance(value, (int, float)):
-                value = float(value)  # may raise
+                value = float(value)
             mlflow.log_metric(key, value, step=step)
         except Exception as e:  # pragma: no cover
             print(f"❌ Failed to log metric {key}: {e}")
@@ -248,13 +226,13 @@ class MLflowBackend:
 
     def set_tag(self, key: str, value: str) -> None:
         try:
-            mlflow.set_tag(key, str(value))
+            mlflow.set_tag(key, _stringify(value))
         except Exception as e:  # pragma: no cover
             print(f"❌ Failed to set tag {key}: {e}")
 
     def set_tags(self, tags: Dict[str, str]) -> None:
         try:
-            mlflow.set_tags({k: str(v) for k, v in tags.items()})
+            mlflow.set_tags({k: _stringify(v) for k, v in tags.items()})
             print(f"🏷️ Set {len(tags)} tags")
         except Exception as e:  # pragma: no cover
             print(f"❌ Failed to set tags: {e}")
@@ -280,9 +258,7 @@ class MLflowBackend:
             print(f"❌ Failed to log artifacts: {e}")
 
     def log_dict(self, dictionary: Dict[str, Any], artifact_file: str) -> None:
-        """Log a dictionary as a JSON artifact under the exact filename.
-        Uses mlflow.log_dict when available; otherwise falls back to a temp dir.
-        """
+        """Log a dictionary as a JSON artifact under the exact filename."""
         try:
             if hasattr(mlflow, "log_dict"):
                 mlflow.log_dict(dictionary, artifact_file=artifact_file)
@@ -318,11 +294,10 @@ class MLflowBackend:
                 mlflow.log_figure(figure, artifact_file)
                 print(f"🖼️ Logged figure as: {artifact_file}")
                 return
-            # Fallback: save PNG to temp and log_artifact
+            # Fallback: save PNG to temp and log_artifacts
             with tempfile.TemporaryDirectory() as tmp:
                 target = Path(tmp) / artifact_file
                 target.parent.mkdir(parents=True, exist_ok=True)
-                # If artifact_file has no extension, default to .png
                 if target.suffix == "":
                     target = target.with_suffix(".png")
                 figure.savefig(str(target), bbox_inches="tight")
@@ -330,6 +305,16 @@ class MLflowBackend:
             print(f"🖼️ Logged figure as: {artifact_file}")
         except Exception as e:  # pragma: no cover
             print(f"❌ Failed to log figure: {e}")
+
+    def log_artifact_with_meta(self, local_path: str, meta: Dict[str, Any], artifact_path: Optional[str] = None) -> None:
+        """Upload a file and a sibling .meta.json with provided metadata."""
+        try:
+            self.log_artifact(local_path, artifact_path)
+            name = os.path.basename(local_path)
+            meta_file = f"{artifact_path + '/' if artifact_path else ''}{name}.meta.json"
+            self.log_dict(meta, meta_file)
+        except Exception as e:  # pragma: no cover
+            print(f"❌ Failed to log artifact metadata: {e}")
 
     # ------------------------------------------------------------------
     # Registry & queries
@@ -339,7 +324,7 @@ class MLflowBackend:
     ) -> Optional[str]:
         try:
             model_uri = f"runs:/{self.current_run_id}/model" if model_path is None else model_path
-            result = mlflow.register_model(model_uri, model_name, tags=tags)
+            result = mlflow.register_model(model_uri, model_name, tags={k: _stringify(v) for k, v in (tags or {}).items()} or None)
             version = result.version
             if description:
                 try:
@@ -361,10 +346,7 @@ class MLflowBackend:
                 experiment_ids = [self.current_experiment_id]
             df = mlflow.search_runs(experiment_ids=experiment_ids, filter_string=filter_string, order_by=order_by, max_results=max_results)
             # Return a list of dicts for portability
-            runs: List[Dict[str, Any]] = []
-            for _, row in df.iterrows():
-                runs.append(row.to_dict())
-            return runs
+            return [row._asdict() if hasattr(row, "_asdict") else row.to_dict() for _, row in df.iterrows()]
         except Exception as e:  # pragma: no cover
             print(f"❌ Failed to search runs: {e}")
             return []
@@ -394,14 +376,14 @@ class MLflowBackend:
     # URLs & cleanup
     # ------------------------------------------------------------------
     def get_experiment_url(self) -> str:
+        base = self.mlflow_config["tracking_uri"].rstrip("/")
         if self.current_experiment_id:
-            base = self.mlflow_config["tracking_uri"].rstrip("/")
             return f"{base}/#/experiments/{self.current_experiment_id}"
-        return self.mlflow_config["tracking_uri"]
+        return base
 
     def get_run_url(self) -> str:
+        base = self.mlflow_config["tracking_uri"].rstrip("/")
         if self.current_run_id and self.current_experiment_id:
-            base = self.mlflow_config["tracking_uri"].rstrip("/")
             return f"{base}/#/experiments/{self.current_experiment_id}/runs/{self.current_run_id}"
         return self.get_experiment_url()
 
