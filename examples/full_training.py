@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-LeZeA MLOps - Complete Training Example
-======================================
+LeZeA MLOps - Complete Training Example (online-ready)
+======================================================
 
-A realistic, end-to-end example that exercises LeZeA MLOps:
 - Experiment setup & rich configuration logging
 - Environment tagging (hardware, OS, Python, packages)
-- DVC dataset versioning
-- GPU/system monitoring + Prometheus metrics
+- DVC dataset versioning (optional)
+- GPU/system monitoring + Prometheus metrics (optional)
 - Training/validation simulation with checkpoints, early stopping
 - Final evaluation + report artifact + optional model registry
+- Plots: loss/accuracy vs. epoch (logged to MLflow artifacts)
 
 Usage:
-  python lezea_mlops/examples/full_training.py \
+  python examples/full_training.py \
       [--config config.yaml] [--experiment-name NAME] [--epochs N] \
       [--batch-size N] [--learning-rate LR]
 """
@@ -29,11 +29,29 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional
 
+# --- Env bootstrap -------------------------------------------------------------
+# Load .env first (so MLflow/MinIO/Postgres vars are present)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# Helpful defaults for MinIO/S3 if not set
+if "MLFLOW_S3_ENDPOINT_URL" not in os.environ and "S3_ENDPOINT_URL" in os.environ:
+    os.environ["MLFLOW_S3_ENDPOINT_URL"] = os.environ["S3_ENDPOINT_URL"]
+os.environ.setdefault("AWS_S3_FORCE_PATH_STYLE", "true")
+
+# --- Matplotlib in headless mode ----------------------------------------------
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# --- LeZeA imports (your modules) -------------------------------------------
+# --- LeZeA imports ------------------------------------------------------------
 from lezea_mlops import ExperimentTracker
 from lezea_mlops.monitoring import get_metrics, GPUMonitor, EnvironmentTagger
 
@@ -46,17 +64,24 @@ class LeZeATrainingExample:
         self.tracker: Optional[ExperimentTracker] = None
         self.metrics = None  # Prometheus collector
         self.gpu_monitor: Optional[GPUMonitor] = None
+        # training history for plots
+        self.history = {
+            "epoch": [],
+            "train_loss": [],
+            "train_accuracy": [],
+            "val_loss": [],
+            "val_accuracy": [],
+        }
 
-    # ---------------------- Setup ------------------------------------------------
+    # ---------------------- Setup ----------------------------------------------
     def setup_experiment(self):
         print("🔧 Setting up experiment...")
 
-        self.tracker = ExperimentTracker(
-            experiment_name=self.config['experiment']['name'],
-            description=self.config['experiment']['description'],
-            tags=self.config['experiment'].get('tags', {}),
-            create_if_not_exists=True,
-        )
+        if self.tracker is None:
+            raise RuntimeError(
+                "ExperimentTracker not set. In main(), create it with a `with` block and assign: "
+                "`with ExperimentTracker(name, purpose) as t: trainer.tracker = t`"
+            )
 
         # Prometheus metrics
         try:
@@ -65,7 +90,7 @@ class LeZeATrainingExample:
             print(f"⚠️  Prometheus metrics unavailable: {e}")
             self.metrics = None
 
-        # GPU monitoring (runs on demand; can also start background loop if you like)
+        # GPU monitoring (runs on demand)
         try:
             self.gpu_monitor = GPUMonitor(sampling_interval=1.0, history_size=2000)
             print("✅ GPU monitoring initialized")
@@ -76,33 +101,31 @@ class LeZeATrainingExample:
         # Environment info + MLflow-compatible tags
         env_tagger = EnvironmentTagger()
         env_info = env_tagger.get_environment_info()
-        env_tags = env_tagger.get_mlflow_tags(env_info)
 
         if hasattr(self.tracker, "log_environment_info"):
             self.tracker.log_environment_info(env_info)
         else:
-            # fallback: at least store a few vital bits
             self.tracker.log_params({
                 "env.platform": env_info.get("system", {}).get("platform"),
                 "env.arch": env_info.get("system", {}).get("architecture"),
             })
 
-        # also set tags if tracker supports it
-        if hasattr(self.tracker, "set_tags"):
-            self.tracker.set_tags(env_tags)
-        else:
-            # conservative fallback to params
-            self.tracker.log_params({f"env_tag.{k}": v for k, v in env_tags.items()})
+        # experiment tags from config
+        exp_tags = self.config['experiment'].get('tags', {})
+        if exp_tags:
+            if hasattr(self.tracker, "set_tags"):
+                self.tracker.set_tags(exp_tags)
+            else:
+                self.tracker.log_params({f"tag.{k}": v for k, v in exp_tags.items()})
 
         print(f"✅ Experiment '{self.tracker.experiment_name}' initialized")
         print(f"📊 Run ID: {self.tracker.run_id}")
-        print("🌐 MLflow UI: http://localhost:5000")
+        print(f"🌐 MLflow UI: {os.getenv('MLFLOW_TRACKING_URI','http://localhost:5000')}")
 
     # ---------------------- Config logging --------------------------------------
     def log_configuration(self):
         print("📝 Logging experiment configuration...")
 
-        # Hyperparameters, model, data basics
         self.tracker.log_params(self.config['model']['hyperparameters'])
 
         if hasattr(self.tracker, "log_model_architecture"):
@@ -147,6 +170,7 @@ class LeZeATrainingExample:
             'load_time_seconds': load_time,
         }
 
+        # Optional dataset metrics (noop if the tracker doesn't expose it)
         if hasattr(self.tracker, "log_dataset_metrics"):
             self.tracker.log_dataset_metrics({
                 'dataset_size_gb': data_cfg['size_gb'],
@@ -155,12 +179,11 @@ class LeZeATrainingExample:
                 'data_loading_time': load_time,
             })
 
-        # DVC dataset versioning (aligns with your DVCBackend API)
+        # DVC dataset versioning (optional; only if tracker exposes a dvc backend)
         try:
             if hasattr(self.tracker, "dvc_backend") and self.tracker.dvc_backend and self.tracker.dvc_backend.available:
                 data_path = str(PROJECT_ROOT / "data" / f"{data_cfg['dataset_name']}.parquet")
                 Path(data_path).parent.mkdir(parents=True, exist_ok=True)
-                # create a dummy file if missing
                 if not Path(data_path).exists():
                     Path(data_path).write_text("lezea-demo-data\n")
 
@@ -170,7 +193,6 @@ class LeZeATrainingExample:
                     data_paths=[data_path],
                     description=f"Dataset {data_cfg['dataset_name']} v{data_cfg['version']}",
                 )
-                # keep a record
                 if hasattr(self.tracker, "log_params"):
                     self.tracker.log_params({"dvc.version_tag": version_info.get("version_tag", "unknown")})
                 print("✅ Dataset versioned with DVC")
@@ -208,7 +230,6 @@ class LeZeATrainingExample:
         else:
             self.tracker.log_params({f"model.{k}": v for k, v in model_info.items()})
 
-        # seed Prometheus model metrics row (optional)
         if self.metrics:
             self.metrics.record_model_metrics(
                 experiment_id=self.tracker.run_id,
@@ -258,6 +279,8 @@ class LeZeATrainingExample:
             )
 
             epoch_time = time.time() - e_start
+            val_acc = val_metrics['val_accuracy']
+
             combined = {
                 **train_metrics, **val_metrics,
                 "epoch": epoch,
@@ -265,13 +288,20 @@ class LeZeATrainingExample:
                 "epoch_time_sec": epoch_time,
             }
 
+            # log aggregates
             self.tracker.log_metrics(combined, step=global_step)
+
+            # accumulate history for plots
+            self.history["epoch"].append(epoch)
+            self.history["train_loss"].append(train_metrics['train_loss'])
+            self.history["train_accuracy"].append(train_metrics['train_accuracy'])
+            self.history["val_loss"].append(val_metrics['val_loss'])
+            self.history["val_accuracy"].append(val_acc)
 
             # GPU + system usage snapshot -> tracker + Prometheus
             self._log_gpu_and_system_metrics()
 
             if self.metrics:
-                # approximate step time + throughput
                 self.metrics.record_training_step(
                     experiment_id=self.tracker.run_id,
                     model_type=self.config['model']['architecture']['type'],
@@ -290,7 +320,6 @@ class LeZeATrainingExample:
                 self._save_checkpoint(epoch, combined)
 
             # early stopping check
-            val_acc = val_metrics['val_accuracy']
             if val_acc > best_val_acc + tr_cfg.get('early_stopping', {}).get('min_delta', 0.0):
                 best_val_acc = val_acc
                 no_improve = 0
@@ -303,15 +332,16 @@ class LeZeATrainingExample:
                   f"| Train: loss={train_metrics['train_loss']:.4f}, acc={train_metrics['train_accuracy']:.4f} "
                   f"| Val: loss={val_metrics['val_loss']:.4f}, acc={val_acc:.4f}")
 
-            # early stop
             if no_improve >= tr_cfg.get('early_stopping', {}).get('patience', 10):
                 print(f"🛑 Early stopping after {no_improve} epochs w/o improvement")
                 break
 
-            # optional manual LR decay
             if epoch > 0 and (epoch % tr_cfg.get('lr_decay_every', 9999) == 0):
                 learning_rate *= tr_cfg.get('lr_decay_factor', 1.0)
                 print(f"📉 LR decayed to {learning_rate:.6f}")
+
+        # log plots as artifacts
+        self._log_training_plots()
 
         print(f"🎯 Training finished | Best val acc: {best_val_acc:.4f}")
         return best_val_acc
@@ -330,7 +360,7 @@ class LeZeATrainingExample:
         loss = float(base_loss + np.random.normal(0, 0.05))
         acc = float(np.clip(base_acc + np.random.normal(0, 0.02), 0.0, 1.0))
 
-        # lightweight per-step logging (10 checkpoints per epoch)
+        # lightweight per-step logging (10 checkpoints/epoch if very large)
         if is_train and steps_per_epoch > 50 and hasattr(self.tracker, "log_metrics"):
             stride = max(1, steps_per_epoch // 10)
             for step in range(0, steps_per_epoch, stride):
@@ -344,10 +374,8 @@ class LeZeATrainingExample:
                 self.tracker.log_metrics(step_metrics, step=global_step + step)
                 time.sleep(0.01)
 
-        # simulate compute time for the epoch
         time.sleep(min(2.0, steps_per_epoch * 0.001))
 
-        # return epoch aggregates
         if is_train:
             return {
                 'train_loss': loss,
@@ -363,15 +391,13 @@ class LeZeATrainingExample:
                 'val_f1_score': float(np.clip(acc * 0.95 + np.random.normal(0, 0.01), 0.0, 1.0)),
             }
 
-    # ---------------------- GPU + system logging helper -------------------------
+    # ---------------------- GPU + system logging --------------------------------
     def _log_gpu_and_system_metrics(self):
         if not self.gpu_monitor:
             return
-
         snapshot = self.gpu_monitor.get_current_usage()
         gpu_list = snapshot.get('gpu_devices', []) or []
 
-        # log to tracker (first GPU summary)
         if gpu_list and hasattr(self.tracker, "log_resource_usage"):
             g0 = gpu_list[0]
             self.tracker.log_resource_usage({
@@ -380,7 +406,6 @@ class LeZeATrainingExample:
                 'gpu_temperature_c': g0.get('temperature_c', g0.get('temperature', 0)),
             })
 
-        # normalize for Prometheus update_gpu_metrics API
         if self.metrics and gpu_list:
             prom_ready = []
             for g in gpu_list:
@@ -430,7 +455,6 @@ class LeZeATrainingExample:
             tmp = f.name
         try:
             self.tracker.log_artifact(tmp, "models/best_model.json")
-            # optional: register to model registry if supported
             if hasattr(self.tracker, "register_model"):
                 model_name = f"{self.config['experiment']['name']}_model"
                 self.tracker.register_model(
@@ -444,6 +468,45 @@ class LeZeATrainingExample:
         finally:
             try: os.unlink(tmp)
             except OSError: pass
+
+    # ---------------------- Plots ----------------------------------------------
+    def _save_and_log_plot(self, x, ys, labels, title, out_path):
+        plt.figure()
+        for y, lbl in zip(ys, labels):
+            plt.plot(x, y, label=lbl)
+        plt.title(title)
+        plt.xlabel("Epoch")
+        plt.legend()
+        plt.tight_layout()
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            plt.savefig(f.name, dpi=144)
+            tmp = f.name
+        plt.close()
+        try:
+            self.tracker.log_artifact(tmp, out_path)
+            print(f"🖼️  Logged figure: {out_path}")
+        finally:
+            try: os.unlink(tmp)
+            except OSError: pass
+
+    def _log_training_plots(self):
+        x = self.history["epoch"]
+        if not x:
+            return
+        self._save_and_log_plot(
+            x,
+            [self.history["train_loss"], self.history["val_loss"]],
+            ["train_loss", "val_loss"],
+            "Loss vs Epoch",
+            "figures/loss_vs_epoch.png",
+        )
+        self._save_and_log_plot(
+            x,
+            [self.history["train_accuracy"], self.history["val_accuracy"]],
+            ["train_acc", "val_acc"],
+            "Accuracy vs Epoch",
+            "figures/accuracy_vs_epoch.png",
+        )
 
     # ---------------------- Evaluation & report ---------------------------------
     def run_evaluation(self, best_accuracy: float) -> Dict[str, float]:
@@ -542,7 +605,6 @@ class LeZeATrainingExample:
             if self.tracker:
                 self.tracker.finish_run(status="FINISHED")
             if self.metrics:
-                # optional: mark experiment completion
                 self.metrics.record_experiment_completion(
                     model_type=self.config['model']['architecture']['type'],
                     success=True,
@@ -627,26 +689,41 @@ def main():
     print("=" * 60)
 
     trainer = LeZeATrainingExample(config)
+
+    # Create the tracker object first; __enter__ returns the started tracker
+    tracker_obj = ExperimentTracker(
+        config['experiment']['name'],
+        config['experiment']['description'],
+    )
+
     try:
-        trainer.setup_experiment()
-        trainer.log_configuration()
-        dataset_info = trainer.simulate_data_loading()
-        model_info = trainer.simulate_model_initialization()
-        best_acc = trainer.simulate_training_loop(dataset_info, model_info)
-        test_metrics = trainer.run_evaluation(best_acc)
-        trainer.generate_final_report(test_metrics)
-        print("\n🎉 Training completed successfully!")
-        print("🌐 MLflow:     http://localhost:5000")
-        print("📊 Prometheus: http://localhost:9090")
-        print("📈 Grafana:    http://localhost:3000")
+        with tracker_obj:             # do NOT use "as tracker"
+            trainer.tracker = tracker_obj
+            trainer.setup_experiment()
+            trainer.log_configuration()
+            dataset_info = trainer.simulate_data_loading()
+            model_info = trainer.simulate_model_initialization()
+            best_acc = trainer.simulate_training_loop(dataset_info, model_info)
+            test_metrics = trainer.run_evaluation(best_acc)
+            trainer.generate_final_report(test_metrics)
+            print("\n🎉 Training completed successfully!")
+            print(f"🌐 MLflow:     {os.getenv('MLFLOW_TRACKING_URI','http://localhost:5000')}")
+            print("📊 Prometheus: http://localhost:9090")
+            print("📈 Grafana:    http://localhost:3000")
     except Exception as e:
         print(f"❌ Training failed: {e}")
-        if trainer.tracker:
-            trainer.tracker.finish_run(status="FAILED")
         raise
     finally:
-        trainer.cleanup()
+        # non-MLflow cleanup if needed
+        try:
+            if trainer.metrics:
+                trainer.metrics.record_experiment_completion(
+                    model_type=trainer.config['model']['architecture']['type'],
+                    success=True,
+                )
+        except Exception:
+            pass
 
-
+# ---- Entrypoint
 if __name__ == "__main__":
     main()

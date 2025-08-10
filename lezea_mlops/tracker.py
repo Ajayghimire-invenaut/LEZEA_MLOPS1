@@ -58,6 +58,26 @@ def _sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def _flatten_params(obj: Dict[str, Any], *, max_str: int = 400) -> Dict[str, Any]:
+    """
+    Flatten nested params to simple key/value pairs for MLflow.
+    Lists/dicts are JSON-encoded (truncated) to stay within UI-friendly limits.
+    """
+    flat: Dict[str, Any] = {}
+    for k, v in (obj or {}).items():
+        if isinstance(v, (int, float, bool)) or v is None:
+            flat[k] = v
+        elif isinstance(v, str):
+            flat[k] = v if len(v) <= max_str else (v[: max_str - 3] + "...")
+        else:
+            try:
+                s = json.dumps(v, separators=(",", ":"))
+                flat[k] = s if len(s) <= max_str else (s[: max_str - 3] + "...")
+            except Exception:
+                flat[k] = str(v)[:max_str]
+    return flat
+
+
 class ExperimentTracker:
     """Unified tracker for LeZeA experiments (spec-aligned)."""
 
@@ -90,6 +110,7 @@ class ExperimentTracker:
         self.start_time: datetime = datetime.now()
         self.end_time: Optional[datetime] = None
         self.is_active = False
+        self.run_id: str = self.experiment_id  # set to MLflow run_id after start()
 
         # Logging
         self.logger = get_logger(f"experiment.{experiment_name}")
@@ -134,6 +155,10 @@ class ExperimentTracker:
         self._cls_macro_f1_sum: Dict[str, float] = defaultdict(float)
         self._gen_n: Dict[str, int] = defaultdict(int)
         self._gen_score_sum: Dict[str, float] = defaultdict(float)
+
+        # In-memory run context for get_run_data()
+        self._model_info: Dict[str, Any] = {}
+        self._artifacts_hint: List[str] = []
 
         # Optional cost model instance (if available)
         self.cost = CostModel.from_env() if CostModel else None  # type: ignore
@@ -274,12 +299,14 @@ class ExperimentTracker:
             # MLflow experiment + run
             if self.backends.get("mlflow"):
                 self._exec_with_retry("mlflow", "create_experiment", self.experiment_name, self.experiment_id)
-                self._exec_with_retry(
+                run_id = self._exec_with_retry(
                     "mlflow",
                     "start_run",
                     f"{self.experiment_name}_{self.experiment_id[:8]}",
                     tags=self.tags,
                 )
+                if isinstance(run_id, str):
+                    self.run_id = run_id
                 self._log_experiment_metadata()
                 self._log_environment()
 
@@ -608,6 +635,134 @@ class ExperimentTracker:
             yield
         finally:
             self._scope_stack.pop()
+
+    # ---------------------------
+    # Convenience shims expected by examples/full_training.py
+    # ---------------------------
+    def set_tags(self, tags: Dict[str, Any]) -> None:
+        """Public method to set tags (MLflow + local state)."""
+        self.tags.update({k: str(v) for k, v in (tags or {}).items()})
+        if self.backends.get("mlflow"):
+            self._submit("mlflow", "set_tags", self.tags, async_ok=False)
+
+    def log_params(self, params: Dict[str, Any]) -> None:
+        """Public method to log params to MLflow (flattened)."""
+        if not params:
+            return
+        flat = _flatten_params(params)
+        if self.backends.get("mlflow"):
+            self._submit("mlflow", "log_params", flat, async_ok=False)
+
+    def log_metrics(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
+        """Public method to log metrics (validated)."""
+        if not metrics:
+            return
+        valid = validate_metrics(metrics)
+        if self.backends.get("mlflow"):
+            self._submit("mlflow", "log_metrics", valid, step=step)
+
+    def log_artifact(self, local_path: str, artifact_path: Optional[str] = None) -> None:
+        """Public method to log an artifact."""
+        if not os.path.exists(local_path):
+            print(f"❌ Artifact not found: {local_path}")
+            return
+        if self.backends.get("mlflow"):
+            if artifact_path:
+                self._submit("mlflow", "log_artifact", local_path, artifact_path=artifact_path, async_ok=False)
+            else:
+                self._submit("mlflow", "log_artifact", local_path, async_ok=False)
+        # keep a light in-memory hint for reports
+        try:
+            rel = os.path.join(artifact_path or "", os.path.basename(local_path))
+            self._artifacts_hint.append(rel)
+        except Exception:
+            pass
+
+    def log_dict(self, payload: Dict[str, Any], artifact_file: str) -> None:
+        if self.backends.get("mlflow"):
+            self._submit("mlflow", "log_dict", payload, artifact_file=artifact_file, async_ok=False)
+        try:
+            self._artifacts_hint.append(artifact_file)
+        except Exception:
+            pass
+
+    def log_text(self, text: str, artifact_file: str) -> None:
+        if self.backends.get("mlflow"):
+            self._submit("mlflow", "log_text", text, artifact_file=artifact_file, async_ok=False)
+        try:
+            self._artifacts_hint.append(artifact_file)
+        except Exception:
+            pass
+
+    def log_model_architecture(self, architecture: Dict[str, Any]) -> None:
+        """Store model architecture as params + JSON artifact."""
+        self.log_params({f"model.arch.{k}": v for k, v in (architecture or {}).items() if not isinstance(v, (dict, list))})
+        self.log_dict(architecture, "model/architecture.json")
+
+    def log_dataset_info(self, dataset_info: Dict[str, Any]) -> None:
+        """Store dataset meta; mirror to params for discoverability."""
+        params = {}
+        for k in ["dataset_name", "version", "features"]:
+            if k in dataset_info:
+                params[f"data.{k}"] = dataset_info[k]
+        self.log_params(params)
+        self.log_dict(dataset_info, "datasets/info.json")
+
+    def log_environment_info(self, env_info: Dict[str, Any]) -> None:
+        """Store a detailed environment snapshot + MLflow-friendly tags."""
+        if self.backends.get("mlflow"):
+            try:
+                tags = EnvironmentTagger.get_mlflow_tags(env_info) if hasattr(EnvironmentTagger, "get_mlflow_tags") else {}
+            except Exception:
+                tags = {}
+            if tags:
+                self.set_tags(tags)
+        self.log_dict(env_info, "environment_info.json")
+
+    def log_model_info(self, model_info: Dict[str, Any]) -> None:
+        """Mirror key model info to params + artifact for reports."""
+        self._model_info.update(model_info or {})
+        self.log_params({f"model.{k}": v for k, v in self._model_info.items() if not isinstance(v, (dict, list))})
+        self.log_dict(self._model_info, "model/info.json")
+
+    def register_model(self, model_name: str, model_path: str, description: str = "") -> Optional[str]:
+        """Optional model registry integration, if backend supports it."""
+        if self.backends.get("mlflow") and hasattr(self.backends["mlflow"], "register_model"):
+            try:
+                return self._exec_with_retry("mlflow", "register_model", model_name, model_path, description=description)
+            except Exception:
+                pass
+        return None
+
+    def get_run_data(self) -> Dict[str, Any]:
+        """Coalesce known run info for reports (robust even if MLflow can't be queried)."""
+        out = {
+            "run_id": self.run_id,
+            "start_time": self.start_time.isoformat(),
+            "end_time": self.end_time.isoformat() if self.end_time else None,
+            "model_info": dict(self._model_info),
+            "tags": dict(self.tags),
+            "artifacts": list(self._artifacts_hint),
+        }
+        # If MLflow backend exposes richer API, try it (best-effort)
+        try:
+            ml = self.backends.get("mlflow")
+            if ml and hasattr(ml, "get_run_data"):
+                rich = ml.get_run_data()
+                if isinstance(rich, dict):
+                    out.update(rich)
+        except Exception:
+            pass
+        return out
+
+    def finish_run(self, status: str = "FINISHED") -> None:
+        """Compatibility shim for older examples; maps to end()."""
+        try:
+            if self.backends.get("mlflow"):
+                self._submit("mlflow", "set_tags", {"run_status": status}, async_ok=False)
+        except Exception:
+            pass
+        self.end()
 
     # ---------------------------
     # Training — metrics & delta + resource/cost sampling + data-usage
