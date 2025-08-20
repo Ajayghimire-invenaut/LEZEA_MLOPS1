@@ -32,6 +32,7 @@ class MongoBackend:
     - Idempotent upserts for high-frequency writes
     - Aggregation helpers (resource/business)
     - Optional TTL on noisy collections
+    - NEW: LeZeA-specific collections and operations
     """
 
     def __init__(self, config):
@@ -83,7 +84,14 @@ class MongoBackend:
             "resources": coll_cfg.get("resources", "resources"),
             "business": coll_cfg.get("business", "business"),
             "datasets": coll_cfg.get("datasets", "datasets"),
-            "rollups":  coll_cfg.get("rollups",  "rollups"),  # new: scope/time rollups
+            "rollups": coll_cfg.get("rollups", "rollups"),
+            # NEW: LeZeA-specific collections
+            "network_lineage": coll_cfg.get("network_lineage", "network_lineage"),
+            "population_history": coll_cfg.get("population_history", "population_history"),
+            "reward_flows": coll_cfg.get("reward_flows", "reward_flows"),
+            "challenge_usage": coll_cfg.get("challenge_usage", "challenge_usage"),
+            "learning_relevance": coll_cfg.get("learning_relevance", "learning_relevance"),
+            "component_resources": coll_cfg.get("component_resources", "component_resources"),
         }
         for key, name in names.items():
             self.collections[key] = self.database[name]
@@ -155,7 +163,48 @@ class MongoBackend:
                                ("scope.entity_id", ASCENDING), ("bucket", ASCENDING)],
                               name="rollup_scope_bucket", unique=True)
 
-            print("📊 MongoDB indexes created")
+            # NEW: LeZeA-specific indexes
+            # Network lineage
+            lineage = self.collections["network_lineage"]
+            lineage.create_index([("experiment_id", ASCENDING), ("network_id", ASCENDING)], unique=True)
+            lineage.create_index([("experiment_id", ASCENDING), ("generation", ASCENDING)])
+            lineage.create_index([("experiment_id", ASCENDING), ("parent_ids", ASCENDING)])
+            lineage.create_index([("fitness_score", DESCENDING)])
+
+            # Population history
+            pop = self.collections["population_history"]
+            pop.create_index([("experiment_id", ASCENDING), ("timestamp", DESCENDING)])
+            pop.create_index([("experiment_id", ASCENDING), ("generation", ASCENDING)])
+            pop.create_index([("avg_fitness", DESCENDING)])
+
+            # Reward flows
+            rewards = self.collections["reward_flows"]
+            rewards.create_index([("experiment_id", ASCENDING), ("timestamp", DESCENDING)])
+            rewards.create_index([("experiment_id", ASCENDING), ("source_id", ASCENDING), ("target_id", ASCENDING)])
+            rewards.create_index([("source_type", ASCENDING), ("target_type", ASCENDING)])
+            rewards.create_index([("task_id", ASCENDING)])
+            rewards.create_index([("reward_value", DESCENDING)])
+
+            # Challenge usage
+            challenge = self.collections["challenge_usage"]
+            challenge.create_index([("experiment_id", ASCENDING), ("challenge_id", ASCENDING), ("timestamp", DESCENDING)])
+            challenge.create_index([("challenge_id", ASCENDING), ("difficulty_level", ASCENDING)])
+            challenge.create_index([("usage_rate", DESCENDING)])
+
+            # Learning relevance
+            relevance = self.collections["learning_relevance"]
+            relevance.create_index([("experiment_id", ASCENDING), ("timestamp", DESCENDING)])
+            relevance.create_index([("sample_ids", ASCENDING)])
+            relevance.create_index([("avg_relevance", DESCENDING)])
+
+            # Component resources
+            comp_res = self.collections["component_resources"]
+            comp_res.create_index([("experiment_id", ASCENDING), ("component_id", ASCENDING), ("timestamp", DESCENDING)])
+            comp_res.create_index([("component_type", ASCENDING)])
+            comp_res.create_index([("cpu_percent", DESCENDING)])
+            comp_res.create_index([("memory_mb", DESCENDING)])
+
+            print("📊 MongoDB indexes created (including LeZeA collections)")
         except Exception as e:
             print(f"⚠️ Could not create all indexes: {e}")
 
@@ -170,7 +219,7 @@ class MongoBackend:
             return False
 
     # ---------------------------------------------------------------------
-    # Stores (idempotent where it matters)
+    # Original stores (idempotent where it matters)
     # ---------------------------------------------------------------------
     def store_experiment_metadata(self, experiment_id: str, metadata: Dict[str, Any]) -> Optional[str]:
         """Append experiment metadata (non-unique stream)."""
@@ -441,7 +490,452 @@ class MongoBackend:
             return None
 
     # ---------------------------------------------------------------------
-    # Queries / analytics
+    # NEW: LeZeA-specific storage methods
+    # ---------------------------------------------------------------------
+    def store_network_lineage(self, experiment_id: str, network_id: str, lineage_data: Dict[str, Any]) -> Optional[str]:
+        """Store or update network lineage information."""
+        try:
+            doc = {
+                "experiment_id": experiment_id,
+                "network_id": network_id,
+                "timestamp": datetime.now(),
+                **lineage_data
+            }
+            filt = {"experiment_id": experiment_id, "network_id": network_id}
+            self.collections["network_lineage"].update_one(filt, {"$set": doc}, upsert=True)
+            print(f"🧬 Stored network lineage: {network_id}")
+            return "upserted"
+        except Exception as e:
+            print(f"❌ Failed to store network lineage: {e}")
+            return None
+
+    def store_population_snapshot(self, experiment_id: str, snapshot_data: Dict[str, Any]) -> Optional[str]:
+        """Store population snapshot."""
+        try:
+            doc = {
+                "experiment_id": experiment_id,
+                "timestamp": datetime.now(),
+                **snapshot_data
+            }
+            result = self.collections["population_history"].insert_one(doc)
+            print(f"👥 Stored population snapshot: generation {snapshot_data.get('generation', 'unknown')}")
+            return str(result.inserted_id)
+        except Exception as e:
+            print(f"❌ Failed to store population snapshot: {e}")
+            return None
+
+    def store_reward_flow(self, experiment_id: str, flow_data: Dict[str, Any]) -> Optional[str]:
+        """Store reward flow between networks."""
+        try:
+            doc = {
+                "experiment_id": experiment_id,
+                "timestamp": datetime.now(),
+                **flow_data
+            }
+            result = self.collections["reward_flows"].insert_one(doc)
+            print(f"💰 Stored reward flow: {flow_data.get('source_id', '?')} → {flow_data.get('target_id', '?')}")
+            return str(result.inserted_id)
+        except Exception as e:
+            print(f"❌ Failed to store reward flow: {e}")
+            return None
+
+    def store_challenge_usage(self, experiment_id: str, usage_data: Dict[str, Any]) -> Optional[str]:
+        """Store challenge-specific usage rates."""
+        try:
+            doc = {
+                "experiment_id": experiment_id,
+                "timestamp": datetime.now(),
+                **usage_data
+            }
+            result = self.collections["challenge_usage"].insert_one(doc)
+            print(f"📈 Stored challenge usage: {usage_data.get('challenge_id', 'unknown')}")
+            return str(result.inserted_id)
+        except Exception as e:
+            print(f"❌ Failed to store challenge usage: {e}")
+            return None
+
+    def store_learning_relevance(self, experiment_id: str, relevance_data: Dict[str, Any]) -> Optional[str]:
+        """Store learning relevance data."""
+        try:
+            doc = {
+                "experiment_id": experiment_id,
+                "timestamp": datetime.now(),
+                **relevance_data
+            }
+            result = self.collections["learning_relevance"].insert_one(doc)
+            print(f"🎯 Stored learning relevance: {len(relevance_data.get('sample_ids', []))} samples")
+            return str(result.inserted_id)
+        except Exception as e:
+            print(f"❌ Failed to store learning relevance: {e}")
+            return None
+
+    def store_component_resource(self, experiment_id: str, component_data: Dict[str, Any]) -> Optional[str]:
+        """Store component-level resource usage."""
+        try:
+            doc = {
+                "experiment_id": experiment_id,
+                "timestamp": datetime.now(),
+                **component_data
+            }
+            result = self.collections["component_resources"].insert_one(doc)
+            return str(result.inserted_id)
+        except Exception as e:
+            print(f"❌ Failed to store component resource: {e}")
+            return None
+
+    # ---------------------------------------------------------------------
+    # NEW: LeZeA-specific queries
+    # ---------------------------------------------------------------------
+    def get_network_genealogy(self, experiment_id: str) -> Dict[str, Any]:
+        """Get complete network genealogy tree."""
+        try:
+            cursor = self.collections["network_lineage"].find(
+                {"experiment_id": experiment_id}
+            ).sort("generation", ASCENDING)
+            
+            networks = {}
+            generations = {}
+            
+            for doc in cursor:
+                network_id = doc["network_id"]
+                generation = doc.get("generation", 0)
+                
+                networks[network_id] = {
+                    "network_id": network_id,
+                    "parent_ids": doc.get("parent_ids", []),
+                    "generation": generation,
+                    "creation_time": doc.get("creation_time", doc["timestamp"]),
+                    "modification_count": doc.get("modification_count", 0),
+                    "fitness_score": doc.get("fitness_score"),
+                }
+                
+                if generation not in generations:
+                    generations[generation] = []
+                generations[generation].append(network_id)
+            
+            return {
+                "networks": networks,
+                "generations": generations,
+                "max_generation": max(generations.keys()) if generations else 0,
+                "total_networks": len(networks)
+            }
+        except Exception as e:
+            print(f"❌ Failed to get network genealogy: {e}")
+            return {}
+
+    def get_population_evolution(self, experiment_id: str) -> List[Dict[str, Any]]:
+        """Get population evolution over time."""
+        try:
+            cursor = self.collections["population_history"].find(
+                {"experiment_id": experiment_id}
+            ).sort("timestamp", ASCENDING)
+            
+            evolution = []
+            for doc in cursor:
+                doc["_id"] = str(doc.get("_id", ""))
+                evolution.append(doc)
+            
+            return evolution
+        except Exception as e:
+            print(f"❌ Failed to get population evolution: {e}")
+            return []
+
+    def get_reward_flow_analysis(self, experiment_id: str) -> Dict[str, Any]:
+        """Analyze reward flows between networks."""
+        try:
+            pipeline = [
+                {"$match": {"experiment_id": experiment_id}},
+                {
+                    "$group": {
+                        "_id": {
+                            "source_type": "$source_type",
+                            "target_type": "$target_type"
+                        },
+                        "total_flows": {"$sum": 1},
+                        "avg_reward": {"$avg": "$reward_value"},
+                        "max_reward": {"$max": "$reward_value"},
+                        "min_reward": {"$min": "$reward_value"},
+                        "total_reward": {"$sum": "$reward_value"}
+                    }
+                },
+                {"$sort": {"total_flows": -1}}
+            ]
+            
+            flow_types = list(self.collections["reward_flows"].aggregate(pipeline))
+            
+            # Get individual network performance
+            network_pipeline = [
+                {"$match": {"experiment_id": experiment_id}},
+                {
+                    "$group": {
+                        "_id": "$source_id",
+                        "total_rewards": {"$sum": "$reward_value"},
+                        "avg_reward": {"$avg": "$reward_value"},
+                        "flow_count": {"$sum": 1},
+                        "targets": {"$addToSet": "$target_id"}
+                    }
+                },
+                {"$sort": {"total_rewards": -1}}
+            ]
+            
+            network_performance = list(self.collections["reward_flows"].aggregate(network_pipeline))
+            
+            return {
+                "flow_type_analysis": flow_types,
+                "network_performance": network_performance,
+                "total_flows": len(list(self.collections["reward_flows"].find({"experiment_id": experiment_id})))
+            }
+        except Exception as e:
+            print(f"❌ Failed to analyze reward flows: {e}")
+            return {}
+
+    def get_challenge_difficulty_analysis(self, experiment_id: str) -> Dict[str, Any]:
+        """Analyze challenge usage by difficulty."""
+        try:
+            pipeline = [
+                {"$match": {"experiment_id": experiment_id}},
+                {
+                    "$group": {
+                        "_id": {
+                            "challenge_id": "$challenge_id",
+                            "difficulty_level": "$difficulty_level"
+                        },
+                        "avg_usage_rate": {"$avg": "$usage_rate"},
+                        "max_usage_rate": {"$max": "$usage_rate"},
+                        "min_usage_rate": {"$min": "$usage_rate"},
+                        "total_samples": {"$sum": "$sample_count"},
+                        "measurement_count": {"$sum": 1}
+                    }
+                },
+                {"$sort": {"_id.challenge_id": 1, "_id.difficulty_level": 1}}
+            ]
+            
+            difficulty_stats = list(self.collections["challenge_usage"].aggregate(pipeline))
+            
+            # Overall challenge ranking
+            challenge_pipeline = [
+                {"$match": {"experiment_id": experiment_id}},
+                {
+                    "$group": {
+                        "_id": "$challenge_id",
+                        "avg_usage_rate": {"$avg": "$usage_rate"},
+                        "total_samples": {"$sum": "$sample_count"},
+                        "difficulty_levels": {"$addToSet": "$difficulty_level"},
+                        "measurement_count": {"$sum": 1}
+                    }
+                },
+                {"$sort": {"avg_usage_rate": -1}}
+            ]
+            
+            challenge_ranking = list(self.collections["challenge_usage"].aggregate(challenge_pipeline))
+            
+            return {
+                "difficulty_analysis": difficulty_stats,
+                "challenge_ranking": challenge_ranking,
+                "total_challenges": len(challenge_ranking)
+            }
+        except Exception as e:
+            print(f"❌ Failed to analyze challenge difficulty: {e}")
+            return {}
+
+    def get_learning_relevance_trends(self, experiment_id: str) -> Dict[str, Any]:
+        """Get learning relevance trends over time."""
+        try:
+            pipeline = [
+                {"$match": {"experiment_id": experiment_id}},
+                {
+                    "$project": {
+                        "timestamp": 1,
+                        "avg_relevance": 1,
+                        "sample_count": {"$size": "$sample_ids"},
+                        "high_relevance_count": {
+                            "$size": {
+                                "$filter": {
+                                    "input": {"$objectToArray": "$relevance_scores"},
+                                    "cond": {"$gt": ["$this.v", 0.7]}
+                                }
+                            }
+                        }
+                    }
+                },
+                {"$sort": {"timestamp": 1}}
+            ]
+            
+            trends = list(self.collections["learning_relevance"].aggregate(pipeline))
+            
+            # Calculate overall statistics
+            if trends:
+                avg_relevance_overall = sum(t.get("avg_relevance", 0) for t in trends) / len(trends)
+                total_samples = sum(t.get("sample_count", 0) for t in trends)
+                total_high_relevance = sum(t.get("high_relevance_count", 0) for t in trends)
+            else:
+                avg_relevance_overall = 0
+                total_samples = 0
+                total_high_relevance = 0
+            
+            return {
+                "trends": trends,
+                "overall_stats": {
+                    "avg_relevance": avg_relevance_overall,
+                    "total_samples": total_samples,
+                    "high_relevance_samples": total_high_relevance,
+                    "high_relevance_ratio": total_high_relevance / max(total_samples, 1)
+                }
+            }
+        except Exception as e:
+            print(f"❌ Failed to get learning relevance trends: {e}")
+            return {}
+
+    def get_component_resource_analysis(self, experiment_id: str) -> Dict[str, Any]:
+        """Analyze resource usage by component type."""
+        try:
+            pipeline = [
+                {"$match": {"experiment_id": experiment_id}},
+                {
+                    "$group": {
+                        "_id": "$component_type",
+                        "avg_cpu_percent": {"$avg": "$cpu_percent"},
+                        "max_cpu_percent": {"$max": "$cpu_percent"},
+                        "avg_memory_mb": {"$avg": "$memory_mb"},
+                        "max_memory_mb": {"$max": "$memory_mb"},
+                        "avg_gpu_util": {"$avg": "$gpu_util_percent"},
+                        "max_gpu_util": {"$max": "$gpu_util_percent"},
+                        "total_io_ops": {"$sum": "$io_operations"},
+                        "component_count": {"$sum": 1},
+                        "unique_components": {"$addToSet": "$component_id"}
+                    }
+                },
+                {"$sort": {"avg_memory_mb": -1}}
+            ]
+            
+            component_stats = list(self.collections["component_resources"].aggregate(pipeline))
+            
+            # Individual component analysis
+            individual_pipeline = [
+                {"$match": {"experiment_id": experiment_id}},
+                {
+                    "$group": {
+                        "_id": {
+                            "component_type": "$component_type",
+                            "component_id": "$component_id"
+                        },
+                        "avg_cpu_percent": {"$avg": "$cpu_percent"},
+                        "avg_memory_mb": {"$avg": "$memory_mb"},
+                        "avg_gpu_util": {"$avg": "$gpu_util_percent"},
+                        "total_io_ops": {"$sum": "$io_operations"},
+                        "measurement_count": {"$sum": 1}
+                    }
+                },
+                {"$sort": {"avg_memory_mb": -1}}
+            ]
+            
+            individual_stats = list(self.collections["component_resources"].aggregate(individual_pipeline))
+            
+            return {
+                "component_type_stats": component_stats,
+                "individual_component_stats": individual_stats,
+                "total_components": len(individual_stats)
+            }
+        except Exception as e:
+            print(f"❌ Failed to analyze component resources: {e}")
+            return {}
+
+    def get_modification_acceptance_analysis(self, experiment_id: str) -> Dict[str, Any]:
+        """Analyze modification acceptance rates."""
+        try:
+            cursor = self.collections["modifications"].find({
+                "experiment_id": experiment_id,
+                "type": "modification_tree"
+            }).sort("timestamp", ASCENDING)
+            
+            total_modifications = 0
+            total_accepted = 0
+            modification_types = {}
+            acceptance_by_step = []
+            
+            for doc in cursor:
+                mod_data = doc.get("modification_data", {})
+                modifications = mod_data.get("modifications", [])
+                stats = mod_data.get("statistics", {})
+                
+                step_accepted = stats.get("accepted_modifications", 0)
+                step_total = stats.get("total_modifications", len(modifications))
+                step_acceptance_rate = step_accepted / max(step_total, 1)
+                
+                total_modifications += step_total
+                total_accepted += step_accepted
+                
+                acceptance_by_step.append({
+                    "step": mod_data.get("step"),
+                    "timestamp": doc["timestamp"],
+                    "total_modifications": step_total,
+                    "accepted_modifications": step_accepted,
+                    "acceptance_rate": step_acceptance_rate
+                })
+                
+                # Track by modification type
+                for mod in modifications:
+                    mod_type = mod.get("type", "unknown")
+                    if mod_type not in modification_types:
+                        modification_types[mod_type] = {"total": 0, "accepted": 0}
+                    
+                    modification_types[mod_type]["total"] += 1
+                    if mod.get("accepted", False):
+                        modification_types[mod_type]["accepted"] += 1
+            
+            # Calculate acceptance rates by type
+            for mod_type in modification_types:
+                stats = modification_types[mod_type]
+                stats["acceptance_rate"] = stats["accepted"] / max(stats["total"], 1)
+            
+            overall_acceptance_rate = total_accepted / max(total_modifications, 1)
+            
+            return {
+                "overall_stats": {
+                    "total_modifications": total_modifications,
+                    "total_accepted": total_accepted,
+                    "overall_acceptance_rate": overall_acceptance_rate
+                },
+                "acceptance_by_step": acceptance_by_step,
+                "modification_types": modification_types
+            }
+        except Exception as e:
+            print(f"❌ Failed to analyze modification acceptance: {e}")
+            return {}
+
+    def get_lezea_experiment_summary(self, experiment_id: str) -> Dict[str, Any]:
+        """Get comprehensive LeZeA experiment summary."""
+        try:
+            summary = {
+                "experiment_id": experiment_id,
+                "generated_at": datetime.now().isoformat(),
+                "network_genealogy": self.get_network_genealogy(experiment_id),
+                "population_evolution": self.get_population_evolution(experiment_id),
+                "reward_flow_analysis": self.get_reward_flow_analysis(experiment_id),
+                "challenge_analysis": self.get_challenge_difficulty_analysis(experiment_id),
+                "learning_relevance": self.get_learning_relevance_trends(experiment_id),
+                "component_resources": self.get_component_resource_analysis(experiment_id),
+                "modification_analysis": self.get_modification_acceptance_analysis(experiment_id)
+            }
+            
+            # Add high-level metrics
+            summary["metrics"] = {
+                "total_networks": summary["network_genealogy"].get("total_networks", 0),
+                "max_generation": summary["network_genealogy"].get("max_generation", 0),
+                "total_population_snapshots": len(summary["population_evolution"]),
+                "total_reward_flows": summary["reward_flow_analysis"].get("total_flows", 0),
+                "total_challenges": summary["challenge_analysis"].get("total_challenges", 0),
+                "overall_acceptance_rate": summary["modification_analysis"].get("overall_stats", {}).get("overall_acceptance_rate", 0),
+                "avg_learning_relevance": summary["learning_relevance"].get("overall_stats", {}).get("avg_relevance", 0)
+            }
+            
+            return summary
+        except Exception as e:
+            print(f"❌ Failed to get LeZeA experiment summary: {e}")
+            return {"error": str(e)}
+
+    # ---------------------------------------------------------------------
+    # Original queries / analytics (unchanged)
     # ---------------------------------------------------------------------
     def get_experiment_data(self, experiment_id: str, data_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get all data across collections for an experiment."""
@@ -560,7 +1054,7 @@ class MongoBackend:
             return {}
 
     # ---------------------------------------------------------------------
-    # Maintenance
+    # Enhanced maintenance with LeZeA collections
     # ---------------------------------------------------------------------
     def search_experiments(self, query_filter: Optional[Dict[str, Any]] = None, limit: int = 100) -> List[Dict[str, Any]]:
         """Search experiments based on criteria in 'experiments'."""

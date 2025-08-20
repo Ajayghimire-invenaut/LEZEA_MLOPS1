@@ -1,5 +1,3 @@
-# lezea_mlops/tracker.py
-
 from __future__ import annotations
 
 import os
@@ -11,12 +9,14 @@ import hashlib
 import random
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 from contextlib import contextmanager
 from collections import defaultdict, Counter
 from threading import Thread, Event
 from queue import Queue, Empty
 import tempfile
+from dataclasses import dataclass, field
+from enum import Enum
 
 # Config
 from .config import config
@@ -45,6 +45,68 @@ try:
     from .business.cost_model import CostModel  # noqa
 except Exception:  # cost model optional
     CostModel = None  # type: ignore
+
+# New LeZeA-specific components
+from .modification.trees import ModificationTree  # Make sure this exists
+
+
+# ---------------------------
+# LeZeA Network Configuration Classes (NEW)
+# ---------------------------
+class NetworkType(Enum):
+    TASKER = "tasker"
+    BUILDER = "builder"
+    HYBRID = "hybrid"
+
+class PopulationStatus(Enum):
+    INITIALIZING = "initializing"
+    ACTIVE = "active"
+    EVOLVING = "evolving"
+    CONVERGED = "converged"
+    TERMINATED = "terminated"
+
+@dataclass
+class NetworkLineage:
+    """Track network genealogy and inheritance"""
+    network_id: str
+    parent_ids: List[str] = field(default_factory=list)
+    generation: int = 0
+    creation_time: datetime = field(default_factory=datetime.now)
+    modification_count: int = 0
+    fitness_score: Optional[float] = None
+    
+@dataclass
+class PopulationSnapshot:
+    """Population state at a point in time"""
+    timestamp: datetime
+    tasker_count: int
+    builder_count: int
+    generation: int
+    avg_fitness: float
+    best_fitness: float
+    worst_fitness: float
+    diversity_metric: float
+
+@dataclass
+class LayerSeedConfig:
+    """Layer-level seed management"""
+    layer_id: str
+    layer_type: str
+    seed: int
+    initialization_method: str
+    parameters: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class RewardFlow:
+    """Tasker ↔ Builder reward tracking"""
+    source_id: str
+    target_id: str
+    source_type: NetworkType
+    target_type: NetworkType
+    reward_value: float
+    task_id: str
+    timestamp: datetime = field(default_factory=datetime.now)
+    performance_metrics: Dict[str, float] = field(default_factory=dict)
 
 
 # ---------------------------
@@ -155,6 +217,19 @@ class ExperimentTracker:
         self._cls_macro_f1_sum: Dict[str, float] = defaultdict(float)
         self._gen_n: Dict[str, int] = defaultdict(int)
         self._gen_score_sum: Dict[str, float] = defaultdict(float)
+
+        # NEW: LeZeA-specific tracking
+        self.network_lineages: Dict[str, NetworkLineage] = {}
+        self.population_history: List[PopulationSnapshot] = []
+        self.layer_seeds: Dict[str, LayerSeedConfig] = {}
+        self.reward_flows: List[RewardFlow] = []
+        self.modification_trees: Dict[int, ModificationTree] = {}
+        self.challenge_usage_rates: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self.sample_importance_weights: Dict[str, float] = {}
+        self.component_resources: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self.tasker_performance: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self.builder_evaluations: Dict[str, Dict[str, float]] = defaultdict(dict)
+        self.population_fitness: Dict[str, List[float]] = defaultdict(list)
 
         # In-memory run context for get_run_data()
         self._model_info: Dict[str, Any] = {}
@@ -363,6 +438,9 @@ class ExperimentTracker:
             # Persist final results summary (per scope)
             _ = self._finalize_results_summary(log_to_backends=True)
 
+            # NEW: Persist LeZeA-specific summaries
+            self._finalize_lezea_summaries()
+
             # Persist data-usage summary + full-state artifact
             if self.data_usage:
                 try:
@@ -482,6 +560,76 @@ class ExperimentTracker:
             print(f"❌ Error ending experiment: {e}")
 
     # ---------------------------
+    # NEW: LeZeA-specific finalization
+    # ---------------------------
+    def _finalize_lezea_summaries(self) -> None:
+        """Persist all LeZeA-specific tracking data"""
+        try:
+            # Network lineage summary
+            lineage_summary = {
+                "total_networks": len(self.network_lineages),
+                "max_generation": max((l.generation for l in self.network_lineages.values()), default=0),
+                "avg_modifications": sum(l.modification_count for l in self.network_lineages.values()) / max(len(self.network_lineages), 1),
+                "lineages": {nid: {
+                    "parent_ids": l.parent_ids,
+                    "generation": l.generation,
+                    "modification_count": l.modification_count,
+                    "fitness_score": l.fitness_score
+                } for nid, l in self.network_lineages.items()}
+            }
+            
+            # Population evolution summary
+            pop_summary = {
+                "snapshots_count": len(self.population_history),
+                "final_population": self.population_history[-1].__dict__ if self.population_history else None,
+                "fitness_progression": [s.avg_fitness for s in self.population_history],
+                "diversity_progression": [s.diversity_metric for s in self.population_history]
+            }
+            
+            # Reward flow summary
+            reward_summary = {
+                "total_flows": len(self.reward_flows),
+                "tasker_to_builder_flows": len([rf for rf in self.reward_flows if rf.source_type == NetworkType.TASKER]),
+                "builder_to_tasker_flows": len([rf for rf in self.reward_flows if rf.source_type == NetworkType.BUILDER]),
+                "avg_reward_value": sum(rf.reward_value for rf in self.reward_flows) / max(len(self.reward_flows), 1)
+            }
+            
+            # Challenge usage rates summary
+            usage_summary = {
+                "challenges_tracked": len(self.challenge_usage_rates),
+                "challenge_stats": {
+                    challenge: {
+                        "avg_rate": sum(rates.values()) / max(len(rates), 1),
+                        "max_rate": max(rates.values()) if rates else 0,
+                        "min_rate": min(rates.values()) if rates else 0
+                    } for challenge, rates in self.challenge_usage_rates.items()
+                }
+            }
+            
+            # Component resource attribution summary
+            resource_summary = {
+                "components_tracked": len(self.component_resources),
+                "total_cpu_usage": sum(res.get("cpu_percent", 0) for res in self.component_resources.values()),
+                "total_memory_usage": sum(res.get("memory_mb", 0) for res in self.component_resources.values())
+            }
+
+            # Log to backends
+            if self.backends.get("mlflow"):
+                self._submit("mlflow", "log_dict", lineage_summary, artifact_file="lezea/network_lineage_summary.json")
+                self._submit("mlflow", "log_dict", pop_summary, artifact_file="lezea/population_summary.json")
+                self._submit("mlflow", "log_dict", reward_summary, artifact_file="lezea/reward_flow_summary.json")
+                self._submit("mlflow", "log_dict", usage_summary, artifact_file="lezea/challenge_usage_summary.json")
+                self._submit("mlflow", "log_dict", resource_summary, artifact_file="lezea/resource_attribution_summary.json")
+                
+            if self.backends.get("mongodb"):
+                self._submit("mongodb", "store_results", self.experiment_id, {"kind": "lezea_lineage_summary", **lineage_summary})
+                self._submit("mongodb", "store_results", self.experiment_id, {"kind": "lezea_population_summary", **pop_summary})
+                self._submit("mongodb", "store_results", self.experiment_id, {"kind": "lezea_reward_summary", **reward_summary})
+                
+        except Exception as e:
+            self.logger.error(f"Failed to finalize LeZeA summaries: {e}")
+
+    # ---------------------------
     # Health Check
     # ---------------------------
     def _ping_backend(self, name: str, obj: Any) -> Tuple[bool, str]:
@@ -514,7 +662,7 @@ class ExperimentTracker:
         return ok_all
 
     # ---------------------------
-    # Spec: 1.4 LeZeA configuration
+    # NEW: 1.4 LeZeA-specific configuration (ENHANCED)
     # ---------------------------
     def log_lezea_config(
         self,
@@ -561,925 +709,390 @@ class ExperimentTracker:
             print(f"❌ Failed to log LeZeA config: {e}")
 
     # ---------------------------
-    # Spec: 1.3 Constraints (+ enforcement)
+    # NEW: Network genealogy & lineage tracking (1.4)
     # ---------------------------
-    def log_constraints(
-        self,
-        max_runtime: Optional[int] = None,
-        max_steps: Optional[int] = None,
-        max_episodes: Optional[int] = None,
+    def register_network(
+        self, 
+        network_id: str, 
+        network_type: NetworkType,
+        parent_ids: Optional[List[str]] = None,
+        generation: int = 0,
+        layer_configs: Optional[List[LayerSeedConfig]] = None
     ) -> None:
+        """Register a new network in the genealogy tree"""
         if not self.is_active:
-            self.logger.warning("Experiment not active")
             return
-        self.constraints = {
-            "max_runtime_seconds": max_runtime,
-            "max_steps": max_steps,
-            "max_episodes": max_episodes,
-            "timestamp": datetime.now().isoformat(),
-        }
+            
+        lineage = NetworkLineage(
+            network_id=network_id,
+            parent_ids=parent_ids or [],
+            generation=generation,
+            creation_time=datetime.now(),
+            modification_count=0
+        )
+        self.network_lineages[network_id] = lineage
+        
+        # Store layer-level seeds if provided
+        if layer_configs:
+            for layer_config in layer_configs:
+                self.layer_seeds[f"{network_id}_{layer_config.layer_id}"] = layer_config
+        
         try:
-            if self.backends.get("mlflow"):
-                params = {k: v for k, v in self.constraints.items() if v is not None and k != "timestamp"}
-                if params:
-                    self._submit("mlflow", "log_params", params, async_ok=False)
-            print(f"⏱️ Logged constraints: { {k:v for k,v in self.constraints.items() if v is not None} }")
-        except Exception as e:  # pragma: no cover — defensive
-            self.logger.error(f"Failed to log constraints: {e}")
-            print(f"❌ Failed to log constraints: {e}")
-
-    def should_stop(self, *, episodes_so_far: Optional[int] = None) -> bool:
-        """Return True if any constraint has been reached/exceeded."""
-        now = datetime.now()
-        if self.constraints.get("max_runtime_seconds"):
-            if (now - self.start_time).total_seconds() >= float(self.constraints["max_runtime_seconds"]):
-                return True
-        if self.constraints.get("max_steps") is not None:
-            if self.training_steps >= int(self.constraints["max_steps"]):
-                return True
-        if self.constraints.get("max_episodes") is not None and episodes_so_far is not None:
-            if int(episodes_so_far) >= int(self.constraints["max_episodes"]):
-                return True
-        return False
-
-    # ---------------------------
-    # Scoping helpers
-    # ---------------------------
-    def _current_scope(self) -> Optional[Dict[str, str]]:
-        return self._scope_stack[-1] if self._scope_stack else None
-
-    def _scope_key(self) -> str:
-        sc = self._current_scope()
-        if not sc:
-            return "global"
-        return f"{sc['level']}:{sc['entity_id']}"
-
-    def _prefix_metrics(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
-        sc = self._current_scope()
-        if not sc:
-            return metrics
-        prefix = f"{sc['level']}/{sc['entity_id']}"
-        return {f"{prefix}/{k}": v for k, v in metrics.items()}
-
-    @contextmanager
-    def scope(self, level: str, entity_id: str, extra_tags: Optional[Dict[str, str]] = None):
-        """Attribute subsequent logs to a specific LeZeA level."""
-        scope_info = {"level": level, "entity_id": entity_id}
-        self._scope_stack.append(scope_info)
-        try:
-            if self.backends.get("mlflow"):
-                try:
-                    self._submit("mlflow", "set_tags", {"scope_level": level, "scope_entity": entity_id, **(extra_tags or {})}, async_ok=False)
-                except Exception:
-                    pass
-            yield
-        finally:
-            self._scope_stack.pop()
-
-    # ---------------------------
-    # Convenience shims expected by examples/full_training.py
-    # ---------------------------
-    def set_tags(self, tags: Dict[str, Any]) -> None:
-        """Public method to set tags (MLflow + local state)."""
-        self.tags.update({k: str(v) for k, v in (tags or {}).items()})
-        if self.backends.get("mlflow"):
-            self._submit("mlflow", "set_tags", self.tags, async_ok=False)
-
-    def log_params(self, params: Dict[str, Any]) -> None:
-        """Public method to log params to MLflow (flattened)."""
-        if not params:
-            return
-        flat = _flatten_params(params)
-        if self.backends.get("mlflow"):
-            self._submit("mlflow", "log_params", flat, async_ok=False)
-
-    def log_metrics(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
-        """Public method to log metrics (validated)."""
-        if not metrics:
-            return
-        valid = validate_metrics(metrics)
-        if self.backends.get("mlflow"):
-            self._submit("mlflow", "log_metrics", valid, step=step)
-
-    def log_artifact(self, local_path: str, artifact_path: Optional[str] = None) -> None:
-        """Public method to log an artifact."""
-        if not os.path.exists(local_path):
-            print(f"❌ Artifact not found: {local_path}")
-            return
-        if self.backends.get("mlflow"):
-            if artifact_path:
-                self._submit("mlflow", "log_artifact", local_path, artifact_path=artifact_path, async_ok=False)
-            else:
-                self._submit("mlflow", "log_artifact", local_path, async_ok=False)
-        # keep a light in-memory hint for reports
-        try:
-            rel = os.path.join(artifact_path or "", os.path.basename(local_path))
-            self._artifacts_hint.append(rel)
-        except Exception:
-            pass
-
-    def log_dict(self, payload: Dict[str, Any], artifact_file: str) -> None:
-        if self.backends.get("mlflow"):
-            self._submit("mlflow", "log_dict", payload, artifact_file=artifact_file, async_ok=False)
-        try:
-            self._artifacts_hint.append(artifact_file)
-        except Exception:
-            pass
-
-    def log_text(self, text: str, artifact_file: str) -> None:
-        if self.backends.get("mlflow"):
-            self._submit("mlflow", "log_text", text, artifact_file=artifact_file, async_ok=False)
-        try:
-            self._artifacts_hint.append(artifact_file)
-        except Exception:
-            pass
-
-    def log_model_architecture(self, architecture: Dict[str, Any]) -> None:
-        """Store model architecture as params + JSON artifact."""
-        self.log_params({f"model.arch.{k}": v for k, v in (architecture or {}).items() if not isinstance(v, (dict, list))})
-        self.log_dict(architecture, "model/architecture.json")
-
-    def log_dataset_info(self, dataset_info: Dict[str, Any]) -> None:
-        """Store dataset meta; mirror to params for discoverability."""
-        params = {}
-        for k in ["dataset_name", "version", "features"]:
-            if k in dataset_info:
-                params[f"data.{k}"] = dataset_info[k]
-        self.log_params(params)
-        self.log_dict(dataset_info, "datasets/info.json")
-
-    def log_environment_info(self, env_info: Dict[str, Any]) -> None:
-        """Store a detailed environment snapshot + MLflow-friendly tags."""
-        if self.backends.get("mlflow"):
-            try:
-                tags = EnvironmentTagger.get_mlflow_tags(env_info) if hasattr(EnvironmentTagger, "get_mlflow_tags") else {}
-            except Exception:
-                tags = {}
-            if tags:
-                self.set_tags(tags)
-        self.log_dict(env_info, "environment_info.json")
-
-    def log_model_info(self, model_info: Dict[str, Any]) -> None:
-        """Mirror key model info to params + artifact for reports."""
-        self._model_info.update(model_info or {})
-        self.log_params({f"model.{k}": v for k, v in self._model_info.items() if not isinstance(v, (dict, list))})
-        self.log_dict(self._model_info, "model/info.json")
-
-    def register_model(self, model_name: str, model_path: str, description: str = "") -> Optional[str]:
-        """Optional model registry integration, if backend supports it."""
-        if self.backends.get("mlflow") and hasattr(self.backends["mlflow"], "register_model"):
-            try:
-                return self._exec_with_retry("mlflow", "register_model", model_name, model_path, description=description)
-            except Exception:
-                pass
-        return None
-
-    def get_run_data(self) -> Dict[str, Any]:
-        """Coalesce known run info for reports (robust even if MLflow can't be queried)."""
-        out = {
-            "run_id": self.run_id,
-            "start_time": self.start_time.isoformat(),
-            "end_time": self.end_time.isoformat() if self.end_time else None,
-            "model_info": dict(self._model_info),
-            "tags": dict(self.tags),
-            "artifacts": list(self._artifacts_hint),
-        }
-        # If MLflow backend exposes richer API, try it (best-effort)
-        try:
-            ml = self.backends.get("mlflow")
-            if ml and hasattr(ml, "get_run_data"):
-                rich = ml.get_run_data()
-                if isinstance(rich, dict):
-                    out.update(rich)
-        except Exception:
-            pass
-        return out
-
-    def finish_run(self, status: str = "FINISHED") -> None:
-        """Compatibility shim for older examples; maps to end()."""
-        try:
-            if self.backends.get("mlflow"):
-                self._submit("mlflow", "set_tags", {"run_status": status}, async_ok=False)
-        except Exception:
-            pass
-        self.end()
-
-    # ---------------------------
-    # Training — metrics & delta + resource/cost sampling + data-usage
-    # ---------------------------
-    def log_training_step(
-        self,
-        step: int,
-        episode: Optional[int] = None,
-        sample_ids: Optional[List[str]] = None,
-        split: Optional[str] = None,
-        **metrics: Any
-    ) -> None:
-        if not self.is_active:
-            self.logger.warning("Experiment not active")
-            return
-        t0 = time.time()
-        try:
-            validated = validate_metrics(metrics)
-
-            # Delta loss (1.5.7.1)
-            if "loss" in validated and isinstance(validated["loss"], (int, float)):
-                if self._last_loss is not None:
-                    validated["delta_loss"] = float(validated["loss"]) - float(self._last_loss)
-                self._last_loss = float(validated["loss"])  # update
-
-            # Data-usage & learning relevance (optional)
-            if self.data_usage and sample_ids and split:
-                try:
-                    # update + collect metrics
-                    self.data_usage.update(sample_ids, split, delta_loss=validated.get("delta_loss"))
-                    usage_metrics = self.data_usage.get_split_metrics(split)
-                    dist_metrics = self.data_usage.distribution_stats(split)
-                    rates = self.data_usage.rates()
-
-                    # MLflow: per-split usage + distribution metrics
-                    if self.backends.get("mlflow"):
-                        prefixed_usage = self._prefix_metrics({f"data/usage/{split}/{k}": v for k, v in usage_metrics.items()})
-                        prefixed_dist = self._prefix_metrics({f"data/usage/{split}/dist_{k}": v for k, v in dist_metrics.items()})
-                        # also log global rates across splits (small count)
-                        prefixed_rates = self._prefix_metrics({f"data/usage/rates/{k}": v for k, v in rates.items()})
-                        self.backends["mlflow"].log_metrics(prefixed_usage, step=step)
-                        self.backends["mlflow"].log_metrics(prefixed_dist, step=step)
-                        if prefixed_rates:
-                            self.backends["mlflow"].log_metrics(prefixed_rates, step=step)
-
-                    # Push to Prometheus exporter (GPU monitor) for Grafana
-                    if self.gpu_monitor and hasattr(self.gpu_monitor, "update_data_usage_metrics"):
-                        try:
-                            self.gpu_monitor.update_data_usage_metrics(
-                                split,
-                                usage_metrics.get("usage_rate"),
-                                dist_metrics.get("gini"),
-                            )
-                        except Exception:
-                            pass
-
-                    # Periodic snapshot (MLflow artifact + Mongo)
-                    if (step % 200 == 0) or (step < 10):
-                        topk = self.data_usage.top_k(split, k=25)
-                        snapshot = {
-                            "split": split,
-                            "step": step,
-                            "usage": usage_metrics,
-                            "distribution": dist_metrics,
-                            "rates": rates,
-                            "top_relevant": topk,
-                            "timestamp": datetime.now().isoformat(),
-                            "scope": self._current_scope() or {"level": "global", "entity_id": "-"},
-                        }
-                        if self.backends.get("mlflow"):
-                            self.backends["mlflow"].log_dict(snapshot, f"data_usage/snapshots/{split}_snapshot_{step}.json")
-                        if self.backends.get("mongodb"):
-                            try:
-                                self.backends["mongodb"].store_results(
-                                    self.experiment_id, {"kind": "data_usage_snapshot", **snapshot}
-                                )
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
-            # Step timing
-            if self._step_times:
-                validated["step_duration_seconds"] = t0 - self._step_times[-1]
-            self._step_times.append(t0)
-            self.training_steps += 1
-
-            # Scope-aware metrics (prefix for MLflow)
-            prefixed = self._prefix_metrics(validated)
-
-            if self.backends.get("mlflow"):
-                self._submit("mlflow", "log_metrics", prefixed, step=step)
-                if episode is not None:
-                    ep_key = self._prefix_metrics({"episode": episode})
-                    k = list(ep_key.keys())[0]
-                    self._submit("mlflow", "log_metric", k, episode, step=step)
-
             if self.backends.get("mongodb"):
-                doc = {
-                    "step": step,
-                    "episode": episode,
+                self._submit("mongodb", "store_results", self.experiment_id, {
+                    "kind": "network_registration",
+                    "network_id": network_id,
+                    "network_type": network_type.value,
+                    "parent_ids": parent_ids or [],
+                    "generation": generation,
                     "timestamp": datetime.now().isoformat(),
-                    "metrics": validated,
-                    "scope": self._current_scope() or {"level": "global", "entity_id": "-"},
-                    "experiment_id": self.experiment_id,
-                    "data_usage": {
-                        "split": split,
-                        "batch_count": len(sample_ids) if sample_ids else 0,
-                    } if split else None,
-                }
-                self._submit("mongodb", "store_training_step", self.experiment_id, doc)
+                    "layer_configs": [
+                        {
+                            "layer_id": lc.layer_id,
+                            "layer_type": lc.layer_type,
+                            "seed": lc.seed,
+                            "initialization_method": lc.initialization_method,
+                            "parameters": lc.parameters
+                        } for lc in (layer_configs or [])
+                    ]
+                })
+            
+            if self.backends.get("mlflow"):
+                self._submit("mlflow", "log_dict", {
+                    "network_id": network_id,
+                    "network_type": network_type.value,
+                    "parent_ids": parent_ids or [],
+                    "generation": generation,
+                    "layer_count": len(layer_configs) if layer_configs else 0
+                }, artifact_file=f"networks/{network_id}_registration.json")
+                
+            print(f"🧬 Registered network: {network_id} (gen {generation})")
+        except Exception as e:
+            self.logger.error(f"Failed to register network: {e}")
 
-            # Resource + optional cost sampling
-            usage = self._sample_resource_usage()
-            self._update_cost_model(validated.get("step_duration_seconds"), usage)
-
-            self._check_performance_warnings(step, validated)
-
-            # Soft enforcement signal
-            if self.should_stop():
-                if not self._stop_signaled:
-                    self._stop_signaled = True
-                    if self.backends.get("mlflow"):
-                        self._submit("mlflow", "set_tags", {"stop_signal": "constraints_reached"}, async_ok=False)
-                    if self.backends.get("mongodb"):
-                        self._submit(
-                            "mongodb",
-                            "store_results",
-                            self.experiment_id,
-                            {"kind": "stop_signal", "reason": "constraints_reached", "at_step": step, "timestamp": datetime.now().isoformat()},
-                        )
-
-            if step % 100 == 0 or step < 10:
-                msg = ", ".join(
-                    f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in validated.items()
-                )
-                print(f"📊 Step {step}: {msg}")
-        except Exception as e:  # pragma: no cover — defensive
-            self.logger.error(f"Failed to log training step {step}: {e}")
-            print(f"❌ Failed to log step {step}: {e}")
+    def update_network_fitness(self, network_id: str, fitness_score: float) -> None:
+        """Update fitness score for a network"""
+        if network_id in self.network_lineages:
+            self.network_lineages[network_id].fitness_score = fitness_score
+            
+    def track_network_modification(self, network_id: str, modification_type: str, details: Dict[str, Any]) -> None:
+        """Track modifications made to a network"""
+        if network_id in self.network_lineages:
+            self.network_lineages[network_id].modification_count += 1
+            
+        try:
+            if self.backends.get("mongodb"):
+                self._submit("mongodb", "store_results", self.experiment_id, {
+                    "kind": "network_modification",
+                    "network_id": network_id,
+                    "modification_type": modification_type,
+                    "details": details,
+                    "timestamp": datetime.now().isoformat()
+                })
+        except Exception as e:
+            self.logger.error(f"Failed to track network modification: {e}")
 
     # ---------------------------
-    # Modifications (1.5.2–1.5.3)
+    # NEW: Population tracking (1.4)
+    # ---------------------------
+    def log_population_snapshot(
+        self,
+        tasker_count: int,
+        builder_count: int,
+        generation: int,
+        fitness_scores: List[float],
+        diversity_metric: float,
+        step: Optional[int] = None
+    ) -> None:
+        """Log current population state"""
+        if not fitness_scores:
+            avg_fitness = best_fitness = worst_fitness = 0.0
+        else:
+            avg_fitness = sum(fitness_scores) / len(fitness_scores)
+            best_fitness = max(fitness_scores)
+            worst_fitness = min(fitness_scores)
+            
+        snapshot = PopulationSnapshot(
+            timestamp=datetime.now(),
+            tasker_count=tasker_count,
+            builder_count=builder_count,
+            generation=generation,
+            avg_fitness=avg_fitness,
+            best_fitness=best_fitness,
+            worst_fitness=worst_fitness,
+            diversity_metric=diversity_metric
+        )
+        self.population_history.append(snapshot)
+        
+        try:
+            if self.backends.get("mlflow"):
+                metrics = {
+                    "population/tasker_count": tasker_count,
+                    "population/builder_count": builder_count,
+                    "population/generation": generation,
+                    "population/avg_fitness": avg_fitness,
+                    "population/best_fitness": best_fitness,
+                    "population/worst_fitness": worst_fitness,
+                    "population/diversity": diversity_metric
+                }
+                self._submit("mlflow", "log_metrics", self._prefix_metrics(metrics), step=step)
+                
+            if self.backends.get("mongodb"):
+                self._submit("mongodb", "store_results", self.experiment_id, {
+                    "kind": "population_snapshot",
+                    **snapshot.__dict__,
+                    "timestamp": snapshot.timestamp.isoformat(),
+                    "fitness_distribution": {
+                        "scores": fitness_scores,
+                        "count": len(fitness_scores)
+                    }
+                })
+                
+            print(f"👥 Population snapshot: Gen {generation}, {tasker_count}T/{builder_count}B, avg_fit={avg_fitness:.3f}")
+        except Exception as e:
+            self.logger.error(f"Failed to log population snapshot: {e}")
+
+    # ---------------------------
+    # NEW: Reward flow tracking (1.6.1)
+    # ---------------------------
+    def log_reward_flow(
+        self,
+        source_id: str,
+        target_id: str,
+        source_type: NetworkType,
+        target_type: NetworkType,
+        reward_value: float,
+        task_id: str,
+        performance_metrics: Optional[Dict[str, float]] = None,
+        step: Optional[int] = None
+    ) -> None:
+        """Log reward transfer between taskers and builders"""
+        reward_flow = RewardFlow(
+            source_id=source_id,
+            target_id=target_id,
+            source_type=source_type,
+            target_type=target_type,
+            reward_value=reward_value,
+            task_id=task_id,
+            performance_metrics=performance_metrics or {}
+        )
+        self.reward_flows.append(reward_flow)
+        
+        # Track performance for fitness tracking
+        if source_type == NetworkType.TASKER:
+            self.tasker_performance[source_id][task_id] = reward_value
+            if target_id not in self.builder_evaluations:
+                self.builder_evaluations[target_id] = {}
+            self.builder_evaluations[target_id][source_id] = reward_value
+            
+        # Update population fitness tracking
+        self.population_fitness[source_id].append(reward_value)
+        
+        try:
+            if self.backends.get("mlflow"):
+                metrics = {
+                    f"reward_flow/{source_type.value}_to_{target_type.value}": reward_value
+                }
+                if performance_metrics:
+                    for k, v in performance_metrics.items():
+                        metrics[f"reward_flow/performance/{k}"] = v
+                self._submit("mlflow", "log_metrics", self._prefix_metrics(metrics), step=step)
+                
+            if self.backends.get("mongodb"):
+                self._submit("mongodb", "store_results", self.experiment_id, {
+                    "kind": "reward_flow",
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "source_type": source_type.value,
+                    "target_type": target_type.value,
+                    "reward_value": reward_value,
+                    "task_id": task_id,
+                    "performance_metrics": performance_metrics or {},
+                    "timestamp": datetime.now().isoformat()
+                })
+                
+            print(f"💰 Reward flow: {source_id} → {target_id} ({reward_value:.3f})")
+        except Exception as e:
+            self.logger.error(f"Failed to log reward flow: {e}")
+
+    # ---------------------------
+    # NEW: Enhanced modification trees (1.5.2-1.5.3)
     # ---------------------------
     def log_modification_tree(self, step: int, modifications: List[Dict[str, Any]], statistics: Dict[str, Any]) -> None:
         if not self.is_active:
             return
         try:
+            # Create modification tree object
+            mod_tree = ModificationTree(step, modifications, statistics)
+            self.modification_trees[step] = mod_tree
+            
+            # Calculate acceptance/rejection stats
+            accepted = len([m for m in modifications if m.get("accepted", False)])
+            rejected = len(modifications) - accepted
+            acceptance_rate = accepted / len(modifications) if modifications else 0
+            
+            # Enhanced statistics
+            enhanced_stats = {
+                **statistics,
+                "total_modifications": len(modifications),
+                "accepted_modifications": accepted,
+                "rejected_modifications": rejected,
+                "acceptance_rate": acceptance_rate,
+                "modification_types": Counter(m.get("type", "unknown") for m in modifications)
+            }
+            
             payload = {
                 "step": step,
                 "timestamp": datetime.now().isoformat(),
                 "modifications": modifications,
-                "statistics": statistics,
+                "statistics": enhanced_stats,
                 "scope": self._current_scope() or {"level": "global", "entity_id": "-"},
             }
+            
             if self.backends.get("mongodb"):
                 self._submit("mongodb", "store_modification_tree", self.experiment_id, payload)
-            if self.backends.get("mlflow") and statistics:
-                numeric = {f"mod_{k}": v for k, v in statistics.items() if isinstance(v, (int, float))}
-                if numeric:
-                    self._submit("mlflow", "log_metrics", self._prefix_metrics(numeric), step=step)
+                
             if self.backends.get("mlflow"):
+                # Log numeric stats as metrics
+                numeric_stats = {f"mod_{k}": v for k, v in enhanced_stats.items() if isinstance(v, (int, float))}
+                if numeric_stats:
+                    self._submit("mlflow", "log_metrics", self._prefix_metrics(numeric_stats), step=step)
                 self._submit("mlflow", "log_dict", payload, artifact_file=f"modifications/step_{step}.json")
-            print(f"🌳 Logged modification tree: {len(modifications)} changes at step {step}")
+                
+            print(f"🌳 Logged modification tree: {len(modifications)} changes, {acceptance_rate:.1%} accepted at step {step}")
         except Exception as e:  # pragma: no cover
             self.logger.error(f"Failed to log modification tree: {e}")
             print(f"❌ Failed to log modification tree: {e}")
 
     # ---------------------------
-    # Data splits & dataset version (1.5.5, §2)
+    # NEW: Challenge-specific data usage rates (1.5.6)
     # ---------------------------
-    def log_data_splits(self, train: int, val: int, test: int, extra: Optional[Dict[str, Any]] = None) -> None:
-        if not self.is_active:
-            return
-        info = {"train": train, "val": val, "test": test, **(extra or {})}
-        try:
-            if self.backends.get("mlflow"):
-                self._submit("mlflow", "log_params", {"split_train": train, "split_val": val, "split_test": test}, async_ok=False)
-                self._submit("mlflow", "log_dict", info, artifact_file="data_splits.json")
-            if self.backends.get("mongodb"):
-                self._submit("mongodb", "store_data_splits", self.experiment_id, info)
-            # Feed totals to data-usage logger if enabled
-            if self.data_usage:
-                try:
-                    self.data_usage.set_split_totals({"train": int(train), "val": int(val), "test": int(test)})
-                except Exception:
-                    pass
-            print("🧩 Logged data splits")
-        except Exception as e:
-            self.logger.error(f"Failed to log data splits: {e}")
-
-    def log_dataset_version(
+    def log_challenge_usage_rate(
         self,
-        dataset_name: str,
-        dataset_root: str = "data/",
-        *,
-        preprocess_code_path: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Record dataset version using DVC if available; otherwise create a basic marker.
-        Also records optional preprocess code hash for lineage."""
-        try:
-            version_info: Optional[Dict[str, Any]] = None
-            dvc = self.backends.get("dvc")
-            if dvc and getattr(dvc, "available", False):
-                version_info = dvc.get_active_dataset_version(dataset_root)
-            else:
-                version_info = {"name": dataset_name, "root": dataset_root, "version_tag": "manual"}
-
-            if preprocess_code_path and os.path.exists(preprocess_code_path):
-                version_info["preprocess_hash"] = _sha256_file(preprocess_code_path)
-
-            if self.backends.get("mlflow") and version_info:
-                self._submit("mlflow", "log_params", {f"dataset_{dataset_name}_version": version_info.get("version_tag", "unknown")}, async_ok=False)
-                self._submit("mlflow", "log_dict", version_info, artifact_file=f"datasets/{dataset_name}_version.json")
-            if self.backends.get("mongodb") and version_info:
-                self._submit("mongodb", "store_dataset_version", self.experiment_id, dataset_name, version_info)
-            print(f"📦 Logged dataset version for {dataset_name}")
-            return version_info
-        except Exception as e:  # pragma: no cover
-            self.logger.error(f"Failed to log dataset version: {e}")
-            print(f"❌ Failed to log dataset version: {e}")
-            return None
-
-    # ---------------------------
-    # Resource & optional cost (1.5.4 + 1.7.1)
-    # ---------------------------
-    def _sample_resource_usage(self) -> Dict[str, Any]:
-        sc_key = self._scope_key()
-        bucket = self._resource_accum.setdefault(sc_key, {"cpu_pct_sum": 0.0, "gpu_mem_mb_sum": 0.0, "samples": 0})
-        usage: Dict[str, Any] = {}
-        try:
-            if self.gpu_monitor and hasattr(self.gpu_monitor, "get_current_usage"):
-                usage = self.gpu_monitor.get_current_usage() or {}
-            cpu_pct = float(usage.get("cpu_percent", 0.0))
-            gpu_mem_mb = float(usage.get("memory_mb", usage.get("gpu_memory_mb", 0.0)))
-            bucket["cpu_pct_sum"] += cpu_pct
-            bucket["gpu_mem_mb_sum"] += gpu_mem_mb
-            bucket["samples"] += 1
-        except Exception:
-            pass
-        return usage
-
-    def _final_resource_summary(self) -> Dict[str, Any]:
-        out: Dict[str, Any] = {"scopes": {}}
-        total_gpu_mb = 0.0
-        total_cpu_pct_avg = 0.0
-        n = 0
-        for scope_key, b in self._resource_accum.items():
-            samples = max(1, int(b.get("samples", 0)))
-            cpu_avg = float(b.get("cpu_pct_sum", 0.0)) / samples
-            gpu_mb_avg = float(b.get("gpu_mem_mb_sum", 0.0)) / samples
-            out["scopes"][scope_key] = {"avg_cpu_percent": cpu_avg, "avg_gpu_mem_mb": gpu_mb_avg, "samples": samples}
-            total_gpu_mb += gpu_mb_avg
-            total_cpu_pct_avg += cpu_avg
-            n += 1
-        if n:
-            out["avg_gpu_mem_mb_overall"] = total_gpu_mb / n
-            out["avg_cpu_percent_overall"] = total_cpu_pct_avg / n
-        return out
-
-    def _update_cost_model(self, dt: Optional[float], usage: Dict[str, Any]) -> None:
-        if not self.cost or not dt or dt <= 0:
-            return
-        try:
-            self.cost.update(
-                scope_key=self._scope_key(),
-                dt_seconds=float(dt),
-                gpu_util=usage.get("util", usage.get("gpu_util_percent", None)),
-                gpu_count=usage.get("gpu_count", 1),
-                cpu_percent=usage.get("cpu_percent", None),
-                cpu_cores=os.cpu_count(),
-                ram_gb=usage.get("ram_gb", None),
-                io_read_bytes=usage.get("io_read_bytes", 0.0),
-                io_write_bytes=usage.get("io_write_bytes", 0.0),
-                gpu_mem_mb=usage.get("memory_mb", None),
-            )
-        except Exception:
-            pass
-
-    # ---------------------------
-    # Checkpoints & final models (1.5.5–1.5.6)
-    # ---------------------------
-    def log_checkpoint(self, checkpoint_path: str, step: Optional[int] = None, role: str = "model", metadata: Optional[Dict[str, Any]] = None) -> None:
-        if not self.is_active:
-            return
-        if not os.path.exists(checkpoint_path):
-            print(f"❌ Checkpoint file not found: {checkpoint_path}")
-            return
-        try:
-            # Integrity + metadata
-            meta = {
-                "sha256": _sha256_file(checkpoint_path),
-                "filesize": os.path.getsize(checkpoint_path),
-                "created_at": datetime.now().isoformat(),
-                "role": role,
-                "scope_key": self._scope_key(),
-            }
-            if metadata:
-                meta.update(metadata)
-
-            # Upload to S3 (if configured)
-            s3_key = None
-            if self.backends.get("s3"):
-                s3_key = self._exec_with_retry(
-                    "s3",
-                    "upload_checkpoint",
-                    checkpoint_path,
-                    self.experiment_id,
-                    step,
-                    meta,
-                )
-                meta["s3_key"] = s3_key
-
-            # Log in MLflow (artifact + meta json + metric)
-            if self.backends.get("mlflow"):
-                self._submit("mlflow", "log_artifact", checkpoint_path, async_ok=False)
-                self._submit("mlflow", "log_dict", meta, artifact_file=f"checkpoints/{Path(checkpoint_path).name}.meta.json")
-                if step is not None:
-                    k = list(self._prefix_metrics({f"{role}_checkpoint_step": step}).keys())[0]
-                    self._submit("mlflow", "log_metric", k, step, step=step)
-
-            # Minimal local fallback (meta only)
-            self._fallback_write(f"checkpoints/{Path(checkpoint_path).name}.meta.local.json", meta)
-
-            self.checkpoints_saved += 1
-            print(f"💾 Logged checkpoint: {Path(checkpoint_path).name} ({role}) -> S3: {s3_key}")
-        except Exception as e:  # pragma: no cover
-            self.logger.error(f"Failed to log checkpoint: {e}")
-            print(f"❌ Failed to log checkpoint: {e}")
-
-    def log_final_models(self, tasker_model_path: Optional[str] = None, builder_model_path: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> None:
-        if not self.is_active:
-            return
-        try:
-            logged = []
-            if tasker_model_path and os.path.exists(tasker_model_path) and self.backends.get("s3"):
-                s3_key = self._exec_with_retry(
-                    "s3",
-                    "upload_final_model",
-                    tasker_model_path,
-                    self.experiment_id,
-                    "tasker",
-                    f"final_tasker_{self.experiment_id[:8]}",
-                    metadata,
-                )
-                logged.append(f"tasker -> {s3_key}")
-            if builder_model_path and os.path.exists(builder_model_path) and self.backends.get("s3"):
-                s3_key = self._exec_with_retry(
-                    "s3",
-                    "upload_final_model",
-                    builder_model_path,
-                    self.experiment_id,
-                    "builder",
-                    f"final_builder_{self.experiment_id[:8]}",
-                    metadata,
-                )
-                logged.append(f"builder -> {s3_key}")
-            if logged:
-                print(f"🏆 Logged final models: {', '.join(logged)}")
-        except Exception as e:
-            self.logger.error(f"Failed to log final models: {e}")
-            print(f"❌ Failed to log final models: {e}")
-
-    # ---------------------------
-    # Results (1.6) — built in
-    # ---------------------------
-    def log_tasker_rewards(self, rewards: Dict[str, float], *, step: Optional[int] = None) -> None:
-        """Log rewards on tasks for Tasker."""
-        scope = self._current_scope()
-        sk = self._scope_key()
-        self._tasker_rewards_n[sk] += 1
-        for k, v in (rewards or {}).items():
-            if isinstance(v, (int, float)):
-                self._tasker_rewards_sum[sk][k] += float(v)
-        if self.backends.get("mlflow") and rewards:
-            self._submit("mlflow", "log_metrics", self._prefix_metrics({f"tasker_reward/{k}": v for k, v in rewards.items()}), step=step or 0)
-            self._submit("mlflow", "log_dict", {"rewards": rewards, "scope": scope, "step": step}, artifact_file=f"results/tasker_rewards_{step or 'na'}.json")
-        if self.backends.get("mongodb"):
-            try:
-                self._submit("mongodb", "store_results", self.experiment_id, {"kind": "tasker_rewards", "rewards": rewards, "scope": scope, "step": step, "timestamp": datetime.now().isoformat()})
-            except Exception:
-                pass
-
-    def log_builder_rewards(self, rewards: Dict[str, float], *, step: Optional[int] = None) -> None:
-        """Log rewards of Taskers for Builder."""
-        scope = self._current_scope()
-        sk = self._scope_key()
-        self._builder_rewards_n[sk] += 1
-        for k, v in (rewards or {}).items():
-            if isinstance(v, (int, float)):
-                self._builder_rewards_sum[sk][k] += float(v)
-        if self.backends.get("mlflow") and rewards:
-            self._submit("mlflow", "log_metrics", self._prefix_metrics({f"builder_reward/{k}": v for k, v in rewards.items()}), step=step or 0)
-            self._submit("mlflow", "log_dict", {"rewards": rewards, "scope": scope, "step": step}, artifact_file=f"results/builder_rewards_{step or 'na'}.json")
-        if self.backends.get("mongodb"):
-            try:
-                self._submit("mongodb", "store_results", self.experiment_id, {"kind": "builder_rewards", "rewards": rewards, "scope": scope, "step": step, "timestamp": datetime.now().isoformat()})
-            except Exception:
-                pass
-
-    def log_rl_episode(self, *, episode: int, total_reward: float, steps: int, actions: Optional[List[Any]] = None, action_dist: Optional[Dict[str, int]] = None, step: Optional[int] = None) -> None:
-        """Log a single RL episode result and optional action distribution."""
-        scope = self._current_scope()
-        sk = self._scope_key()
-        if action_dist is None and actions is not None:
-            c = Counter(str(a) for a in actions)
-            action_dist = dict(c)
-        self._rl_episodes_n[sk] += 1
-        self._rl_total_reward[sk] += float(total_reward)
-        self._rl_total_steps[sk] += int(steps)
-        if action_dist:
-            self._rl_action_dist[sk].update(action_dist)
-        # metrics
-        metrics = {"episode_reward": float(total_reward), "episode_steps": int(steps)}
-        for a, cnt in (action_dist or {}).items():
-            metrics[f"actions/{a}"] = float(cnt)
-        if self.backends.get("mlflow"):
-            self._submit("mlflow", "log_metrics", self._prefix_metrics({f"rl/{k}": v for k, v in metrics.items()}), step=step or episode)
-            self._submit("mlflow", "log_dict", {"episode": episode, "total_reward": total_reward, "steps": steps, "action_dist": action_dist or {}, "scope": scope}, artifact_file=f"results/rl_episode_{episode}.json")
-        if self.backends.get("mongodb"):
-            try:
-                self._submit("mongodb", "store_results", self.experiment_id, {"kind": "rl_episode", "episode": episode, "total_reward": total_reward, "steps": steps, "action_dist": action_dist or {}, "scope": scope, "timestamp": datetime.now().isoformat()})
-            except Exception:
-                pass
-
-    def log_classification_results(self, y_true: List[Any], y_pred: List[Any], *, labels: Optional[List[Any]] = None, split: str = "val", step: Optional[int] = None) -> Dict[str, Any]:
-        """Compute accuracy/precision/recall/F1 + confusion matrix and log."""
-        scope = self._current_scope()
-        sk = self._scope_key()
-        if len(y_true) != len(y_pred):
-            raise ValueError("y_true and y_pred must have the same length")
-        y_true_s = list(map(str, y_true))
-        y_pred_s = list(map(str, y_pred))
-        if labels is None:
-            label_set = sorted(set(y_true_s) | set(y_pred_s))
-        else:
-            label_set = list(map(str, labels))
-
-        # confusion
-        conf: Dict[str, Dict[str, int]] = {t: {p: 0 for p in label_set} for t in label_set}
-        for t, p in zip(y_true_s, y_pred_s):
-            if t not in conf:
-                conf[t] = {p2: 0 for p2 in label_set}
-            if p not in conf[t]:
-                conf[t][p] = 0
-            conf[t][p] += 1
-
-        # metrics
-        correct = sum(conf[l].get(l, 0) for l in label_set)
-        total = len(y_true_s)
-        acc = correct / total if total else 0.0
-        macro_p = macro_r = macro_f1 = 0.0
-        n_labels = len(label_set) if label_set else 1
-        for l in label_set:
-            tp = conf[l].get(l, 0)
-            fp = sum(conf[t].get(l, 0) for t in label_set if t != l)
-            fn = sum(conf[l].get(p, 0) for p in label_set if p != l)
-            prec = tp / (tp + fp) if (tp + fp) else 0.0
-            rec = tp / (tp + fn) if (tp + fn) else 0.0
-            f1 = (2 * prec * rec) / (prec + rec) if (prec + rec) else 0.0
-            macro_p += prec
-            macro_r += rec
-            macro_f1 += f1
-        macro_p /= n_labels
-        macro_r /= n_labels
-        macro_f1 /= n_labels
-
-        self._cls_n[sk] += 1
-        self._cls_acc_sum[sk] += acc
-        self._cls_macro_f1_sum[sk] += macro_f1
-
-        # log
-        if self.backends.get("mlflow"):
-            base = f"cls/{split}/"
-            self._submit("mlflow", "log_metrics", self._prefix_metrics({f"{base}accuracy": acc, f"{base}macro_precision": macro_p, f"{base}macro_recall": macro_r, f"{base}macro_f1": macro_f1}), step=step or 0)
-            self._submit("mlflow", "log_dict", {"split": split, "labels": label_set, "accuracy": acc, "macro_precision": macro_p, "macro_recall": macro_r, "macro_f1": macro_f1, "confusion": conf, "scope": scope, "step": step}, artifact_file=f"results/classification_{split}_{step or 'na'}.json")
-        if self.backends.get("mongodb"):
-            try:
-                self._submit("mongodb", "store_results", self.experiment_id, {"kind": "classification", "split": split, "accuracy": acc, "macro_precision": macro_p, "macro_recall": macro_r, "macro_f1": macro_f1, "confusion": conf, "scope": scope, "timestamp": datetime.now().isoformat()})
-            except Exception:
-                pass
-        return {"accuracy": acc, "macro_precision": macro_p, "macro_recall": macro_r, "macro_f1": macro_f1, "confusion": conf, "labels": label_set}
-
-    def log_generation_outputs(self, items: List[Dict[str, Any]], *, name: str = "default", step: Optional[int] = None) -> Dict[str, Any]:
-        """Log generation samples; compute average score if provided."""
-        scope = self._current_scope()
-        sk = self._scope_key()
-        scores = [it.get("score") for it in items if isinstance(it.get("score"), (int, float))]
-        avg_score = (sum(scores) / len(scores)) if scores else None
-        self._gen_n[sk] += len(items)
-        if avg_score is not None:
-            self._gen_score_sum[sk] += avg_score * len(items)  # weight by count for running mean
-        if self.backends.get("mlflow"):
-            if avg_score is not None:
-                self._submit("mlflow", "log_metrics", self._prefix_metrics({f"gen/{name}/avg_score": float(avg_score)}), step=step or 0)
-            self._submit("mlflow", "log_dict", {"name": name, "items": items, "avg_score": avg_score, "count": len(items), "scope": scope, "step": step}, artifact_file=f"results/generation_{name}_{step or 'na'}.json")
-        if self.backends.get("mongodb"):
-            try:
-                self._submit("mongodb", "store_results", self.experiment_id, {"kind": "generation", "name": name, "count": len(items), "avg_score": avg_score, "scope": scope, "timestamp": datetime.now().isoformat()})
-            except Exception:
-                pass
-        return {"avg_score": avg_score, "count": len(items)}
-
-    # Backward compatibility: simple results blob
-    def log_results(
-        self,
-        tasker_rewards: Optional[Dict[str, float]] = None,
-        builder_rewards: Optional[Dict[str, float]] = None,
-        actions_outputs: Optional[Dict[str, Any]] = None,
-        step: Optional[int] = None,
+        challenge_id: str,
+        difficulty_level: str,
+        usage_rate: float,
+        sample_count: int,
+        importance_weights: Optional[Dict[str, float]] = None,
+        step: Optional[int] = None
     ) -> None:
-        if tasker_rewards:
-            self.log_tasker_rewards(tasker_rewards, step=step)
-        if builder_rewards:
-            self.log_builder_rewards(builder_rewards, step=step)
-        if actions_outputs and self.backends.get("mlflow"):
-            self._submit("mlflow", "log_dict", actions_outputs, artifact_file=f"results/actions_outputs_{step or 'na'}.json")
-        if actions_outputs and self.backends.get("mongodb"):
-            try:
-                self._submit("mongodb", "store_results", self.experiment_id, {"kind": "actions_outputs", "payload": actions_outputs, "scope": self._current_scope() or {"level": "global", "entity_id": "-"}, "timestamp": datetime.now().isoformat(), "step": step})
-            except Exception:
-                pass
-        print("✅ Logged results")
-
-    # ---------------------------
-    # Business (1.7)
-    # ---------------------------
-    def log_business_metrics(self, cost: float, comments: str = "", conclusion: str = "") -> None:
-        if not self.is_active:
-            return
+        """Log data usage rates per challenge with difficulty analysis"""
+        self.challenge_usage_rates[challenge_id][difficulty_level] = usage_rate
+        
+        if importance_weights:
+            for sample_id, weight in importance_weights.items():
+                self.sample_importance_weights[f"{challenge_id}_{sample_id}"] = weight
+        
         try:
-            payload = {
-                "cost": float(cost),
-                "comments": comments,
-                "conclusion": conclusion,
-                "timestamp": datetime.now().isoformat(),
-            }
+            if self.backends.get("mlflow"):
+                metrics = {
+                    f"data_usage/challenge/{challenge_id}/{difficulty_level}/rate": usage_rate,
+                    f"data_usage/challenge/{challenge_id}/{difficulty_level}/count": sample_count
+                }
+                if importance_weights:
+                    avg_importance = sum(importance_weights.values()) / len(importance_weights)
+                    metrics[f"data_usage/challenge/{challenge_id}/{difficulty_level}/avg_importance"] = avg_importance
+                    
+                self._submit("mlflow", "log_metrics", self._prefix_metrics(metrics), step=step)
+                
             if self.backends.get("mongodb"):
-                self._submit("mongodb", "store_business_metrics", self.experiment_id, payload)
-            if self.backends.get("mlflow"):
-                self._submit("mlflow", "log_metric", "total_cost_manual", float(cost), step=None)
-                note = comments + ("\n\nConclusion: " + conclusion if conclusion else "")
-                self._submit("mlflow", "log_text", note, artifact_file="business/notes.txt", async_ok=False)
-            self.total_cost += float(cost)
-            print(f"💰 Logged business metrics (manual): €{cost:.2f}")
-        except Exception as e:  # pragma: no cover
-            self.logger.error(f"Failed to log business metrics: {e}")
-            print(f"❌ Failed to log business metrics: {e}")
+                self._submit("mongodb", "store_results", self.experiment_id, {
+                    "kind": "challenge_usage_rate",
+                    "challenge_id": challenge_id,
+                    "difficulty_level": difficulty_level,
+                    "usage_rate": usage_rate,
+                    "sample_count": sample_count,
+                    "importance_weights": importance_weights or {},
+                    "timestamp": datetime.now().isoformat()
+                })
+                
+        except Exception as e:
+            self.logger.error(f"Failed to log challenge usage rate: {e}")
 
     # ---------------------------
-    # Spec helpers: metadata & environment
+    # NEW: Enhanced learning relevance (1.5.7)
     # ---------------------------
-    def _log_experiment_metadata(self) -> None:
+    def log_learning_relevance(
+        self,
+        sample_ids: List[str],
+        relevance_scores: Dict[str, float],
+        challenge_rankings: Dict[str, int],
+        step: Optional[int] = None
+    ) -> None:
+        """Log learning relevance with automatic scoring and challenge ranking"""
         try:
+            avg_relevance = sum(relevance_scores.values()) / len(relevance_scores) if relevance_scores else 0
+            
             if self.backends.get("mlflow"):
-                meta = {
-                    "experiment_id": self.experiment_id,
-                    "experiment_name": self.experiment_name,
-                    "purpose": self.purpose,
-                    "start_timestamp": self.start_time.isoformat(),
+                metrics = {
+                    "learning_relevance/avg_score": avg_relevance,
+                    "learning_relevance/sample_count": len(sample_ids),
+                    "learning_relevance/high_relevance_count": len([s for s in relevance_scores.values() if s > 0.7])
                 }
-                meta.update(self.tags)
-                self._exec_with_retry("mlflow", "set_tags", meta)
-        except Exception as e:  # pragma: no cover
-            self.logger.error(f"Failed to log experiment metadata: {e}")
-
-    def _log_environment(self) -> None:
-        try:
-            if not self.env_tagger:
-                return
-            env_info = self.env_tagger.get_environment_info()
-            try:
-                if hasattr(self.env_tagger, "get_git_info"):
-                    env_info["git"] = self.env_tagger.get_git_info()
-            except Exception:
-                pass
-            if self.backends.get("mlflow"):
-                env_tags = self.env_tagger.get_mlflow_tags(env_info)
-                self._exec_with_retry("mlflow", "set_tags", env_tags)
-                self._exec_with_retry("mlflow", "log_dict", env_info, artifact_file="environment_info.json")
-        except Exception as e:  # pragma: no cover
-            self.logger.error(f"Failed to log environment: {e}")
-
-    def _check_performance_warnings(self, step: int, metrics: Dict[str, Any]) -> None:
-        try:
-            warnings: List[str] = []
-            for k, v in metrics.items():
-                if isinstance(v, float):
-                    if v != v:  # NaN
-                        warnings.append(f"NaN value detected in {k} at step {step}")
-                    elif abs(v) == float("inf"):
-                        warnings.append(f"Infinite value detected in {k} at step {step}")
-            if warnings:
-                self._resource_warnings.extend(warnings)
-                self._resource_warnings = self._resource_warnings[-20:]
-                for w in warnings:
-                    self.logger.warning(w)
-        except Exception:  # pragma: no cover
-            pass
-
-    # ---------------------------
-    # Final summaries & recommendations
-    # ---------------------------
-    def _finalize_results_summary(self, *, log_to_backends: bool = True) -> Dict[str, Any]:
-        """Aggregate compact results per scope and optionally persist."""
-        out: Dict[str, Any] = {"created_at": datetime.now().isoformat(), "scopes": {}}
-        scope_keys = set(self._tasker_rewards_n) | set(self._builder_rewards_n) | set(self._rl_episodes_n) | set(self._cls_n) | set(self._gen_n)
-        for sk in sorted(scope_keys):
-            s: Dict[str, Any] = {}
-            # tasker
-            if self._tasker_rewards_n.get(sk, 0):
-                n = self._tasker_rewards_n[sk]
-                sums = dict(self._tasker_rewards_sum[sk])
-                s["tasker_rewards_avg"] = {k: (v / n) for k, v in sums.items()}
-            # builder
-            if self._builder_rewards_n.get(sk, 0):
-                n = self._builder_rewards_n[sk]
-                sums = dict(self._builder_rewards_sum[sk])
-                s["builder_rewards_avg"] = {k: (v / n) for k, v in sums.items()}
-            # rl
-            if self._rl_episodes_n.get(sk, 0):
-                n = self._rl_episodes_n[sk]
-                s["rl"] = {
-                    "episodes": n,
-                    "avg_reward": self._rl_total_reward[sk] / n,
-                    "avg_steps": self._rl_total_steps[sk] / n,
-                    "action_dist_total": dict(self._rl_action_dist[sk]),
-                }
-            # classification
-            if self._cls_n.get(sk, 0):
-                n = self._cls_n[sk]
-                s["classification"] = {
-                    "records": n,
-                    "avg_accuracy": self._cls_acc_sum[sk] / n,
-                    "avg_macro_f1": self._cls_macro_f1_sum[sk] / n,
-                }
-            # generation
-            if self._gen_n.get(sk, 0):
-                s["generation"] = {
-                    "samples": self._gen_n[sk],
-                    "avg_score": (self._gen_score_sum[sk] / self._gen_n[sk]) if self._gen_n[sk] else None,
-                }
-            out["scopes"][sk] = s
-
-        if log_to_backends:
-            if self.backends.get("mlflow"):
-                self._submit("mlflow", "log_dict", out, artifact_file="results/summary.json")
+                self._submit("mlflow", "log_metrics", self._prefix_metrics(metrics), step=step)
+                
             if self.backends.get("mongodb"):
-                try:
-                    self._submit("mongodb", "store_results", self.experiment_id, {"kind": "results_summary", **out})
-                except Exception:
-                    pass
-        return out
-
-    def get_experiment_summary(self) -> Dict[str, Any]:
-        try:
-            duration = (
-                (datetime.now() - self.start_time).total_seconds() if self.is_active else
-                (self.end_time - self.start_time).total_seconds() if self.end_time else 0
-            )
-            summary: Dict[str, Any] = {
-                "experiment_id": self.experiment_id,
-                "name": self.experiment_name,
-                "purpose": self.purpose,
-                "status": "Running" if self.is_active else "Completed",
-                "duration_seconds": duration,
-                "start_time": self.start_time.isoformat(),
-                "end_time": self.end_time.isoformat() if self.end_time else None,
-                "training_steps": self.training_steps,
-                "checkpoints_saved": self.checkpoints_saved,
-                "total_cost": self.total_cost,
-                "lezea_config": self.lezea_config,
-                "constraints": self.constraints,
-                "backends_available": [k for k, v in self.backends.items() if v is not None],
-                "backend_errors": self.backend_errors,
-                "resource_summary": self._final_resource_summary(),
-            }
-            if self._step_times:
-                summary["avg_step_time"] = sum(
-                    self._step_times[i] - self._step_times[i - 1] for i in range(1, len(self._step_times))
-                ) / max(1, len(self._step_times) - 1)
-            if self._resource_warnings:
-                summary["resource_warnings"] = self._resource_warnings[-5:]
-            return summary
-        except Exception as e:  # pragma: no cover
-            self.logger.error(f"Failed to get experiment summary: {e}")
-            return {"error": str(e)}
-
-    def get_recommendations(self) -> List[str]:
-        recs: List[str] = []
-        try:
-            duration = (datetime.now() - self.start_time).total_seconds()
-            if duration > 3600:
-                recs.append("Long experiment duration — checkpoint more often.")
-            if len(self._step_times) > 10:
-                recent = self._step_times[-10:]
-                deltas = [recent[i] - recent[i - 1] for i in range(1, len(recent))]
-                if sum(deltas) / max(1, len(deltas)) > 10:
-                    recs.append("Slow steps — consider batch size / dataloader tuning.")
-            failed = [k for k, v in self.backends.items() if v is None]
-            if failed:
-                recs.append(f"Backends unavailable: {', '.join(failed)} — fix for full functionality.")
-            if not recs:
-                recs.append("Experiment running efficiently — no immediate actions.")
-            return recs
-        except Exception:  # pragma: no cover
-            return ["Unable to generate recommendations."]
+                self._submit("mongodb", "store_results", self.experiment_id, {
+                    "kind": "learning_relevance",
+                    "sample_ids": sample_ids,
+                    "relevance_scores": relevance_scores,
+                    "challenge_rankings": challenge_rankings,
+                    "avg_relevance": avg_relevance,
+                    "timestamp": datetime.now().isoformat()
+                })
+                
+            # Update data usage logger if available
+            if self.data_usage:
+                for sample_id, score in relevance_scores.items():
+                    self.data_usage.update_relevance(sample_id, score)
+                    
+        except Exception as e:
+            self.logger.error(f"Failed to log learning relevance: {e}")
 
     # ---------------------------
-    # Context manager sugar
+    # NEW: Component-level resource attribution (1.5.4)
     # ---------------------------
-    def __enter__(self) -> "ExperimentTracker":
-        return self.start()
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        if exc_type is not None:
-            self.logger.error(f"Experiment failed with {exc_type.__name__}: {exc_val}")
-            print(f"❌ Experiment failed: {exc_val}")
-        self.end()
-        # Do not suppress exceptions
+    def log_component_resources(
+        self,
+        component_id: str,
+        component_type: str,  # "builder", "tasker", "algorithm", "network", "layer"
+        cpu_percent: float,
+        memory_mb: float,
+        gpu_util_percent: Optional[float] = None,
+        io_operations: Optional[int] = None,
+        step: Optional[int] = None
+    ) -> None:
+        """Log resource usage at component level"""
+        resource_data = {
+            "cpu_percent": cpu_percent,
+            "memory_mb": memory_mb,
+            "gpu_util_percent": gpu_util_percent or 0,
+            "io_operations": io_operations or 0,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        self.component_resources[f"{component_type}_{component_id}"] = resource_data
+        
+        try:
+            if self.backends.get("mlflow"):
+                metrics = {
+                    f"resources/{component_type}/{component_id}/cpu_percent": cpu_percent,
+                    f"resources/{component_type}/{component_id}/memory_mb": memory_mb
+                }
+                if gpu_util_percent is not None:
+                    metrics[f"resources/{component_type}/{component_id}/gpu_util"] = gpu_util_percent
+                if io_operations is not None:
+                    metrics[f"resources/{component_type}/{component_id}/io_ops"] = io_operations
+                    
+                self._submit("mlflow", "log_metrics", self._prefix_metrics(metrics), step=step)
+                
+            if self.backends.get("mongodb"):
+                self._submit("mongodb", "store_results", self.experiment_id, {
+                    "kind": "component_resources",
+                    "component_id": component_id,
+                    "component_type": component_type,
+                    **resource_data
+                })
+                
+        except Exception as e:
+            self.logger.error(f"Failed to log component resources: {e}")
