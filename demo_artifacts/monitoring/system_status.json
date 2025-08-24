@@ -1,0 +1,7 @@
+{
+  "mongodb": "tracked by ExperimentTracker (if enabled)",
+  "prometheus": "optional (Pushgateway)",
+  "grafana": "optional dashboards",
+  "object_storage": "S3 via MLflow artifact root",
+  "mlflow": "http://127.0.0.1:5000"
+}

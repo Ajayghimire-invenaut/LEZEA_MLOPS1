@@ -1,0 +1,114 @@
+{
+  "history": [
+    {
+      "epoch": 1,
+      "loss": 2.225,
+      "accuracy": 0.37,
+      "perplexity": 13.2,
+      "learning_rate": 9.5e-05,
+      "tokens_processed": 1000000000,
+      "delta_loss": 0.0,
+      "gpu_utilization": 96,
+      "memory_usage_gb": 47
+    },
+    {
+      "epoch": 2,
+      "loss": 1.90625,
+      "accuracy": 0.44,
+      "perplexity": 10.8,
+      "learning_rate": 9.025e-05,
+      "tokens_processed": 2000000000,
+      "delta_loss": 0.3187500000000001,
+      "gpu_utilization": 97,
+      "memory_usage_gb": 49
+    },
+    {
+      "epoch": 3,
+      "loss": 1.6353125,
+      "accuracy": 0.51,
+      "perplexity": 8.88,
+      "learning_rate": 8.573749999999999e-05,
+      "tokens_processed": 3000000000,
+      "delta_loss": 0.27093750000000005,
+      "gpu_utilization": 95,
+      "memory_usage_gb": 51
+    },
+    {
+      "epoch": 4,
+      "loss": 1.4050156249999999,
+      "accuracy": 0.5800000000000001,
+      "perplexity": 7.344000000000001,
+      "learning_rate": 8.1450625e-05,
+      "tokens_processed": 4000000000,
+      "delta_loss": 0.23029687500000007,
+      "gpu_utilization": 96,
+      "memory_usage_gb": 53
+    },
+    {
+      "epoch": 5,
+      "loss": 1.20926328125,
+      "accuracy": 0.65,
+      "perplexity": 6.1152000000000015,
+      "learning_rate": 7.737809374999998e-05,
+      "tokens_processed": 5000000000,
+      "delta_loss": 0.19575234374999995,
+      "gpu_utilization": 97,
+      "memory_usage_gb": 55
+    },
+    {
+      "epoch": 6,
+      "loss": 1.0428737890625,
+      "accuracy": 0.72,
+      "perplexity": 5.132160000000002,
+      "learning_rate": 7.350918906249998e-05,
+      "tokens_processed": 6000000000,
+      "delta_loss": 0.1663894921875,
+      "gpu_utilization": 95,
+      "memory_usage_gb": 57
+    },
+    {
+      "epoch": 7,
+      "loss": 0.9014427207031248,
+      "accuracy": 0.79,
+      "perplexity": 4.345728000000001,
+      "learning_rate": 6.983372960937497e-05,
+      "tokens_processed": 7000000000,
+      "delta_loss": 0.14143106835937513,
+      "gpu_utilization": 96,
+      "memory_usage_gb": 59
+    },
+    {
+      "epoch": 8,
+      "loss": 0.7812263125976561,
+      "accuracy": 0.8600000000000001,
+      "perplexity": 3.716582400000001,
+      "learning_rate": 6.634204312890623e-05,
+      "tokens_processed": 8000000000,
+      "delta_loss": 0.12021640810546874,
+      "gpu_utilization": 97,
+      "memory_usage_gb": 61
+    },
+    {
+      "epoch": 9,
+      "loss": 0.6790423657080077,
+      "accuracy": 0.9300000000000002,
+      "perplexity": 3.2132659200000013,
+      "learning_rate": 6.30249409724609e-05,
+      "tokens_processed": 9000000000,
+      "delta_loss": 0.10218394688964838,
+      "gpu_utilization": 95,
+      "memory_usage_gb": 63
+    },
+    {
+      "epoch": 10,
+      "loss": 0.5921860108518064,
+      "accuracy": 0.95,
+      "perplexity": 2.810612736000001,
+      "learning_rate": 5.987369392383787e-05,
+      "tokens_processed": 10000000000,
+      "delta_loss": 0.08685635485620125,
+      "gpu_utilization": 96,
+      "memory_usage_gb": 65
+    }
+  ]
+}

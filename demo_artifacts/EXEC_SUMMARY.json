@@ -1,0 +1,14 @@
+{
+  "run_id": "cb9c2ab3dc2a4df48c51fbc6da739189",
+  "artifact_index": [
+    "env/agi_config.json",
+    "training/history.json",
+    "plots/metrics.png",
+    "data/dataset_info_full.json",
+    "business/business_summary.json",
+    "monitoring/system_status.json",
+    "results/performance_summary.json",
+    "results/integration_readiness.json",
+    "checkpoints/*"
+  ]
+}
