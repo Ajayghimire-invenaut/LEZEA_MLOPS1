@@ -9,7 +9,7 @@ import hashlib
 import random
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple, Set, Mapping
 from contextlib import contextmanager
 from collections import defaultdict, Counter
 from threading import Thread, Event
@@ -17,6 +17,8 @@ from queue import Queue, Empty
 import tempfile
 from dataclasses import dataclass, field
 from enum import Enum
+import platform
+import subprocess
 
 # Config
 from .config import config
@@ -47,7 +49,11 @@ except Exception:  # cost model optional
     CostModel = None  # type: ignore
 
 # New LeZeA-specific components
-from .modification.trees import ModificationTree  # Make sure this exists
+try:
+    from .modification.trees import ModificationTree  # Make sure this exists
+except Exception:
+    # Compat alias: some repos expose ModTree only
+    from .modification.trees import ModTree as ModificationTree  # type: ignore
 
 
 # ---------------------------
@@ -119,6 +125,14 @@ def _sha256_file(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+def _git_commit_or_none() -> Optional[str]:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        return None
 
 def _flatten_params(obj: Dict[str, Any], *, max_str: int = 400) -> Dict[str, Any]:
     """
@@ -138,6 +152,16 @@ def _flatten_params(obj: Dict[str, Any], *, max_str: int = 400) -> Dict[str, Any
             except Exception:
                 flat[k] = str(v)[:max_str]
     return flat
+
+def _safe_float_map(metrics: Mapping[str, Any]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for k, v in metrics.items():
+        try:
+            out[k] = float(v)
+        except Exception:
+            # skip non-numerics silently; they go into JSON artifacts if needed
+            continue
+    return out
 
 
 class ExperimentTracker:
@@ -453,16 +477,14 @@ class ExperimentTracker:
                         with tempfile.TemporaryDirectory() as tmp:
                             dump_path = os.path.join(tmp, "data_usage_state.json")
                             try:
-                                # `export_json` exists in the updated DataUsageLogger
-                                self.data_usage.export_json(dump_path)
+                                self.data_usage.export_json(dump_path)  # type: ignore[attr-defined]
                             except Exception:
-                                # Fallback to embedding the internal state if export_json is unavailable
                                 payload = {
                                     "state": {
-                                        "split_totals": self.data_usage.split_totals,
-                                        "seen_ids": {k: list(v) for k, v in self.data_usage.seen_ids.items()},
-                                        "exposures": dict(self.data_usage.exposures),
-                                        "relevance": {k: dict(v) for k, v in self.data_usage.relevance.items()},
+                                        "split_totals": getattr(self.data_usage, "split_totals", {}),
+                                        "seen_ids": {k: list(v) for k, v in getattr(self.data_usage, "seen_ids", {}).items()},
+                                        "exposures": dict(getattr(self.data_usage, "exposures", {})),
+                                        "relevance": {k: dict(v) for k, v in getattr(self.data_usage, "relevance", {}).items()},
                                     },
                                     "summary": summary,
                                     "exported_at": datetime.now().isoformat(),
@@ -500,7 +522,7 @@ class ExperimentTracker:
                     except Exception:
                         pass
                 try:
-                    self.total_cost = float(cost_summary.get("total_eur", self.total_cost))
+                    self.total_cost = float(cost_summary.get("total_eur", self.total_cost))  # type: ignore[union-attr]
                 except Exception:
                     pass
 
@@ -516,13 +538,16 @@ class ExperimentTracker:
             res_summary = self._final_resource_summary()
             if self.backends.get("mlflow"):
                 # Log numeric resource summary as metrics + full JSON as artifact
-                numeric_flat = {}
+                numeric_flat: Dict[str, float] = {}
                 for scope_key, vals in res_summary.get("scopes", {}).items():
                     for k, v in vals.items():
                         if isinstance(v, (int, float)):
-                            numeric_flat[f"resource/{scope_key}/{k}"] = v
-                numeric_flat.update({k: v for k, v in res_summary.items() if isinstance(v, (int, float))})
-                self._submit("mlflow", "log_metrics", numeric_flat, step=None)
+                            numeric_flat[f"resource/{scope_key}/{k}"] = float(v)
+                for k, v in res_summary.items():
+                    if isinstance(v, (int, float)):
+                        numeric_flat[k] = float(v)
+                if numeric_flat:
+                    self._submit("mlflow", "log_metrics", numeric_flat, step=None)
                 self._submit("mlflow", "log_dict", res_summary, artifact_file="resources/summary.json")
                 try:
                     self._exec_with_retry("mlflow", "end_run")
@@ -569,48 +594,54 @@ class ExperimentTracker:
             lineage_summary = {
                 "total_networks": len(self.network_lineages),
                 "max_generation": max((l.generation for l in self.network_lineages.values()), default=0),
-                "avg_modifications": sum(l.modification_count for l in self.network_lineages.values()) / max(len(self.network_lineages), 1),
-                "lineages": {nid: {
-                    "parent_ids": l.parent_ids,
-                    "generation": l.generation,
-                    "modification_count": l.modification_count,
-                    "fitness_score": l.fitness_score
-                } for nid, l in self.network_lineages.items()}
+                "avg_modifications": (
+                    sum(l.modification_count for l in self.network_lineages.values()) / max(len(self.network_lineages), 1)
+                ),
+                "lineages": {
+                    nid: {
+                        "parent_ids": l.parent_ids,
+                        "generation": l.generation,
+                        "modification_count": l.modification_count,
+                        "fitness_score": l.fitness_score,
+                    }
+                    for nid, l in self.network_lineages.items()
+                },
             }
-            
+
             # Population evolution summary
             pop_summary = {
                 "snapshots_count": len(self.population_history),
                 "final_population": self.population_history[-1].__dict__ if self.population_history else None,
                 "fitness_progression": [s.avg_fitness for s in self.population_history],
-                "diversity_progression": [s.diversity_metric for s in self.population_history]
+                "diversity_progression": [s.diversity_metric for s in self.population_history],
             }
-            
+
             # Reward flow summary
             reward_summary = {
                 "total_flows": len(self.reward_flows),
                 "tasker_to_builder_flows": len([rf for rf in self.reward_flows if rf.source_type == NetworkType.TASKER]),
                 "builder_to_tasker_flows": len([rf for rf in self.reward_flows if rf.source_type == NetworkType.BUILDER]),
-                "avg_reward_value": sum(rf.reward_value for rf in self.reward_flows) / max(len(self.reward_flows), 1)
+                "avg_reward_value": sum((rf.reward_value for rf in self.reward_flows), 0.0) / max(len(self.reward_flows), 1),
             }
-            
+
             # Challenge usage rates summary
             usage_summary = {
                 "challenges_tracked": len(self.challenge_usage_rates),
                 "challenge_stats": {
                     challenge: {
                         "avg_rate": sum(rates.values()) / max(len(rates), 1),
-                        "max_rate": max(rates.values()) if rates else 0,
-                        "min_rate": min(rates.values()) if rates else 0
-                    } for challenge, rates in self.challenge_usage_rates.items()
-                }
+                        "max_rate": max(rates.values()) if rates else 0.0,
+                        "min_rate": min(rates.values()) if rates else 0.0,
+                    }
+                    for challenge, rates in self.challenge_usage_rates.items()
+                },
             }
-            
+
             # Component resource attribution summary
             resource_summary = {
                 "components_tracked": len(self.component_resources),
-                "total_cpu_usage": sum(res.get("cpu_percent", 0) for res in self.component_resources.values()),
-                "total_memory_usage": sum(res.get("memory_mb", 0) for res in self.component_resources.values())
+                "total_cpu_usage": sum(res.get("cpu_percent", 0.0) for res in self.component_resources.values()),
+                "total_memory_usage": sum(res.get("memory_mb", 0.0) for res in self.component_resources.values()),
             }
 
             # Log to backends
@@ -620,12 +651,11 @@ class ExperimentTracker:
                 self._submit("mlflow", "log_dict", reward_summary, artifact_file="lezea/reward_flow_summary.json")
                 self._submit("mlflow", "log_dict", usage_summary, artifact_file="lezea/challenge_usage_summary.json")
                 self._submit("mlflow", "log_dict", resource_summary, artifact_file="lezea/resource_attribution_summary.json")
-                
+
             if self.backends.get("mongodb"):
                 self._submit("mongodb", "store_results", self.experiment_id, {"kind": "lezea_lineage_summary", **lineage_summary})
                 self._submit("mongodb", "store_results", self.experiment_id, {"kind": "lezea_population_summary", **pop_summary})
                 self._submit("mongodb", "store_results", self.experiment_id, {"kind": "lezea_reward_summary", **reward_summary})
-                
         except Exception as e:
             self.logger.error(f"Failed to finalize LeZeA summaries: {e}")
 
@@ -929,7 +959,7 @@ class ExperimentTracker:
             # Calculate acceptance/rejection stats
             accepted = len([m for m in modifications if m.get("accepted", False)])
             rejected = len(modifications) - accepted
-            acceptance_rate = accepted / len(modifications) if modifications else 0
+            acceptance_rate = accepted / len(modifications) if modifications else 0.0
             
             # Enhanced statistics
             enhanced_stats = {
@@ -987,7 +1017,7 @@ class ExperimentTracker:
             if self.backends.get("mlflow"):
                 metrics = {
                     f"data_usage/challenge/{challenge_id}/{difficulty_level}/rate": usage_rate,
-                    f"data_usage/challenge/{challenge_id}/{difficulty_level}/count": sample_count
+                    f"data_usage/challenge/{challenge_id}/{difficulty_level}/count": float(sample_count)
                 }
                 if importance_weights:
                     avg_importance = sum(importance_weights.values()) / len(importance_weights)
@@ -1021,13 +1051,13 @@ class ExperimentTracker:
     ) -> None:
         """Log learning relevance with automatic scoring and challenge ranking"""
         try:
-            avg_relevance = sum(relevance_scores.values()) / len(relevance_scores) if relevance_scores else 0
+            avg_relevance = sum(relevance_scores.values()) / len(relevance_scores) if relevance_scores else 0.0
             
             if self.backends.get("mlflow"):
                 metrics = {
                     "learning_relevance/avg_score": avg_relevance,
-                    "learning_relevance/sample_count": len(sample_ids),
-                    "learning_relevance/high_relevance_count": len([s for s in relevance_scores.values() if s > 0.7])
+                    "learning_relevance/sample_count": float(len(sample_ids)),
+                    "learning_relevance/high_relevance_count": float(len([s for s in relevance_scores.values() if s > 0.7]))
                 }
                 self._submit("mlflow", "log_metrics", self._prefix_metrics(metrics), step=step)
                 
@@ -1044,7 +1074,10 @@ class ExperimentTracker:
             # Update data usage logger if available
             if self.data_usage:
                 for sample_id, score in relevance_scores.items():
-                    self.data_usage.update_relevance(sample_id, score)
+                    try:
+                        self.data_usage.update_relevance(sample_id, score)
+                    except Exception:
+                        pass
                     
         except Exception as e:
             self.logger.error(f"Failed to log learning relevance: {e}")
@@ -1064,10 +1097,10 @@ class ExperimentTracker:
     ) -> None:
         """Log resource usage at component level"""
         resource_data = {
-            "cpu_percent": cpu_percent,
-            "memory_mb": memory_mb,
-            "gpu_util_percent": gpu_util_percent or 0,
-            "io_operations": io_operations or 0,
+            "cpu_percent": float(cpu_percent),
+            "memory_mb": float(memory_mb),
+            "gpu_util_percent": float(gpu_util_percent or 0.0),
+            "io_operations": int(io_operations or 0),
             "timestamp": datetime.now().isoformat()
         }
         
@@ -1076,13 +1109,13 @@ class ExperimentTracker:
         try:
             if self.backends.get("mlflow"):
                 metrics = {
-                    f"resources/{component_type}/{component_id}/cpu_percent": cpu_percent,
-                    f"resources/{component_type}/{component_id}/memory_mb": memory_mb
+                    f"resources/{component_type}/{component_id}/cpu_percent": float(cpu_percent),
+                    f"resources/{component_type}/{component_id}/memory_mb": float(memory_mb)
                 }
                 if gpu_util_percent is not None:
-                    metrics[f"resources/{component_type}/{component_id}/gpu_util"] = gpu_util_percent
+                    metrics[f"resources/{component_type}/{component_id}/gpu_util"] = float(gpu_util_percent)
                 if io_operations is not None:
-                    metrics[f"resources/{component_type}/{component_id}/io_ops"] = io_operations
+                    metrics[f"resources/{component_type}/{component_id}/io_ops"] = float(io_operations)
                     
                 self._submit("mlflow", "log_metrics", self._prefix_metrics(metrics), step=step)
                 
@@ -1096,3 +1129,425 @@ class ExperimentTracker:
                 
         except Exception as e:
             self.logger.error(f"Failed to log component resources: {e}")
+
+    # ---------------------------
+    # Spec 1.1 Metadata + 1.2 Environment + 1.3 Constraints
+    # ---------------------------
+    def _log_experiment_metadata(self) -> None:
+        meta = {
+            "experiment_id": self.experiment_id,
+            "experiment_name": self.experiment_name,
+            "purpose": self.purpose,
+            "start_ts": self.start_time.isoformat(),
+            "tags": self.tags,
+        }
+        if self.backends.get("mlflow"):
+            self._submit("mlflow", "log_params", _flatten_params(meta), async_ok=False)
+            self._submit("mlflow", "log_dict", meta, artifact_file="meta/experiment.json")
+        if self.backends.get("postgres"):
+            try:
+                self._submit("postgres", "store_experiment_metadata", meta)  # optional backend
+            except Exception:
+                pass
+
+    def _log_environment(self) -> None:
+        env: Dict[str, Any] = {
+            "platform": platform.platform(),
+            "python_version": platform.python_version(),
+            "machine": platform.machine(),
+            "node": platform.node(),
+            "processor": platform.processor(),
+            "git_commit": _git_commit_or_none(),
+            "config_profile": getattr(config, "profile", "default"),
+        }
+        if self.env_tagger:
+            try:
+                env.update(self.env_tagger.tags())  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        if self.backends.get("mlflow"):
+            params = {
+                "env_platform": env["platform"],
+                "env_python": env["python_version"],
+                "env_git": env.get("git_commit") or "none",
+            }
+            self._submit("mlflow", "log_params", params, async_ok=False)
+            self._submit("mlflow", "log_dict", env, artifact_file="environment/env_full.json")
+        if self.backends.get("mongodb"):
+            self._submit("mongodb", "store_environment", self.experiment_id, env)
+
+    def log_constraints(
+        self,
+        runtime_limit_sec: Optional[int] = None,
+        steps_episodes: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.constraints = {
+            "runtime_limit_sec": runtime_limit_sec,
+            "steps_episodes": steps_episodes or {},
+            "set_ts": datetime.now().isoformat(),
+        }
+        if self.backends.get("mlflow"):
+            params: Dict[str, Any] = {}
+            if runtime_limit_sec is not None:
+                params["runtime_limit_sec"] = int(runtime_limit_sec)
+            self._submit("mlflow", "log_params", params, async_ok=False)
+            self._submit("mlflow", "log_dict", self.constraints, artifact_file="constraints/constraints.json")
+        if self.backends.get("mongodb"):
+            self._submit("mongodb", "store_constraints", self.experiment_id, self.constraints)
+
+    # ---------------------------
+    # Scope helpers
+    # ---------------------------
+    def _scope_key(self) -> str:
+        if not self._scope_stack:
+            return "global"
+        s = self._scope_stack[-1]
+        return f"{s['level']}:{s['entity_id']}"
+
+    def _current_scope(self) -> Optional[Dict[str, str]]:
+        return self._scope_stack[-1] if self._scope_stack else None
+
+    def _prefix_metrics(self, metrics: Mapping[str, Any]) -> Dict[str, float]:
+        clean = _safe_float_map(metrics)
+        scope = self._scope_key()
+        return {f"{scope}/{k}" if scope != "global" else k: v for k, v in clean.items()}
+
+    @contextmanager
+    def scope(self, level: str, entity_id: str):
+        self._scope_stack.append({"level": level, "entity_id": entity_id})
+        try:
+            yield
+        finally:
+            self._scope_stack.pop()
+
+    # Convenience scopes
+    def builder_scope(self, builder_id: str):
+        return self.scope("builder", builder_id)
+
+    def tasker_scope(self, tasker_id: str):
+        return self.scope("tasker", tasker_id)
+
+    def algorithm_scope(self, algo_name: str):
+        return self.scope("algorithm", algo_name)
+
+    def network_scope(self, net_id: str):
+        return self.scope("network", net_id)
+
+    def layer_scope(self, layer_id: str):
+        return self.scope("layer", layer_id)
+
+    # ---------------------------
+    # Spec 1.5 Training — per-step metrics, logs, usage, delta loss
+    # ---------------------------
+    def log_training_step(
+        self,
+        step: int,
+        metrics: Mapping[str, Any],
+        sample_ids: Optional[List[str]] = None,
+        split: Optional[str] = None,
+        modification_path: Optional[List[str]] = None,
+        modification_stats: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        validate_metrics(metrics)
+        self.training_steps = max(self.training_steps, int(step))
+        # Delta loss (if metric 'loss' is present)
+        if "loss" in metrics:
+            try:
+                loss_val = float(metrics["loss"])
+                if self._last_loss is not None:
+                    metrics = dict(metrics)
+                    metrics["delta_loss"] = float(self._last_loss - loss_val)
+                self._last_loss = loss_val
+            except Exception:
+                pass
+
+        # MLflow numeric metrics
+        if self.backends.get("mlflow"):
+            self._submit("mlflow", "log_metrics", self._prefix_metrics(metrics), step=step)
+
+        # Mongo detailed record
+        if self.backends.get("mongodb"):
+            self._submit("mongodb", "store_results", self.experiment_id, {
+                "kind": "training_step",
+                "step": int(step),
+                "ts": datetime.now().isoformat(),
+                "metrics": dict(metrics),
+                "split": split,
+                "sample_ids": sample_ids or [],
+                "scope": self._current_scope(),
+                "modification_path": modification_path or [],
+                "modification_stats": modification_stats or {},
+            })
+
+    # ---------------------------
+    # Spec 1.5.5 — Data subset splitting
+    # ---------------------------
+    def log_data_splits(
+        self,
+        train_ids: Optional[List[str]] = None,
+        val_ids: Optional[List[str]] = None,
+        test_ids: Optional[List[str]] = None,
+    ) -> None:
+        payload = {
+            "train_size": len(train_ids or []),
+            "val_size": len(val_ids or []),
+            "test_size": len(test_ids or []),
+            "ts": datetime.now().isoformat(),
+        }
+        if self.backends.get("mlflow"):
+            self._submit("mlflow", "log_dict", payload, artifact_file="data/splits.json")
+        if self.backends.get("mongodb"):
+            self._submit("mongodb", "store_results", self.experiment_id, {"kind": "data_splits", **payload})
+        if self.data_usage:
+            try:
+                if train_ids:
+                    for sid in train_ids:
+                        self.data_usage.mark_seen(sid, split="train")  # type: ignore[attr-defined]
+                if val_ids:
+                    for sid in val_ids:
+                        self.data_usage.mark_seen(sid, split="val")    # type: ignore[attr-defined]
+                if test_ids:
+                    for sid in test_ids:
+                        self.data_usage.mark_seen(sid, split="test")   # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+    # ---------------------------
+    # Spec 1.5.6 — Data usage (per-sample/challenge)
+    # ---------------------------
+    def log_data_exposure(
+        self,
+        sample_id: str,
+        split: str,
+        challenge_id: Optional[str] = None
+    ) -> None:
+        if self.data_usage:
+            try:
+                self.data_usage.record(sample_id, split=split, challenge=challenge_id)  # type: ignore[attr-defined]
+            except Exception:
+                pass
+
+    # ---------------------------
+    # Spec 1.5.4 / 1.5.6 — Resource stats rollup helpers
+    # ---------------------------
+    def _acc_resource(self, key: str, values: Mapping[str, Any]) -> None:
+        d = self._resource_accum.setdefault(key, {})
+        for k, v in _safe_float_map(values).items():
+            d[k] = d.get(k, 0.0) + float(v)
+
+    def _final_resource_summary(self) -> Dict[str, Any]:
+        total_cpu = sum(v.get("cpu_percent", 0.0) for v in self.component_resources.values())
+        total_mem = sum(v.get("memory_mb", 0.0) for v in self.component_resources.values())
+        scopes = {k: dict(v) for k, v in self._resource_accum.items()}
+        return {
+            "total_cpu_percent_accum": total_cpu,
+            "total_memory_mb_accum": total_mem,
+            "scopes": scopes,
+        }
+
+    # ---------------------------
+    # Spec 1.5.5 / 1.5.6 — Checkpoints & models (S3 if configured)
+    # ---------------------------
+    def log_checkpoint(
+        self,
+        path: str,
+        step: Optional[int] = None,
+        role: str = "model",
+        metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        self.checkpoints_saved += 1
+        info = {
+            "sha256": _sha256_file(path) if os.path.exists(path) else None,
+            "size_bytes": os.path.getsize(path) if os.path.exists(path) else None,
+            "role": role,
+            "step": step,
+            "ts": datetime.now().isoformat(),
+            "metadata": metadata or {},
+        }
+
+        # Upload to S3 (optional)
+        if self.backends.get("s3") and os.path.exists(path):
+            try:
+                s3_key = self._exec_with_retry("s3", "upload_file", path, prefix=f"{self.experiment_id}/checkpoints/")
+                info["s3_key"] = s3_key
+            except Exception as e:
+                self.logger.warning(f"S3 upload failed: {e}")
+
+        # Log via MLflow
+        if self.backends.get("mlflow"):
+            try:
+                self._submit("mlflow", "log_artifact", path, artifact_path="checkpoints")
+            except Exception:
+                pass
+            self._submit("mlflow", "log_dict", info, artifact_file=f"checkpoints/meta_{self.checkpoints_saved:04d}.json")
+
+        # Record in Mongo
+        if self.backends.get("mongodb"):
+            self._submit("mongodb", "store_results", self.experiment_id, {"kind": "checkpoint", **info})
+
+    # ---------------------------
+    # Spec 1.6 — Results (rewards/actions/outputs)
+    # ---------------------------
+    def log_results(
+        self,
+        *,
+        tasker_rewards: Optional[Dict[str, float]] = None,
+        builder_rewards: Optional[Dict[str, float]] = None,
+        actions_outputs: Optional[Dict[str, Any]] = None,
+        step: Optional[int] = None
+    ) -> None:
+        scope = self._scope_key()
+
+        # Aggregate
+        if tasker_rewards:
+            self._tasker_rewards_sum[scope].update(tasker_rewards)  # type: ignore[arg-type]
+            self._tasker_rewards_n[scope] += 1
+        if builder_rewards:
+            self._builder_rewards_sum[scope].update(builder_rewards)  # type: ignore[arg-type]
+            self._builder_rewards_n[scope] += 1
+
+        # MLflow quick metrics
+        if self.backends.get("mlflow"):
+            metrics: Dict[str, float] = {}
+            if tasker_rewards:
+                for k, v in tasker_rewards.items():
+                    metrics[f"results/tasker_rewards/{k}"] = float(v)
+            if builder_rewards:
+                for k, v in builder_rewards.items():
+                    metrics[f"results/builder_rewards/{k}"] = float(v)
+            if metrics:
+                self._submit("mlflow", "log_metrics", self._prefix_metrics(metrics), step=step)
+            if actions_outputs:
+                # store compact JSON
+                self._submit("mlflow", "log_dict", actions_outputs, artifact_file=f"results/actions_outputs_step_{step or 0}.json")
+
+        # Mongo full
+        if self.backends.get("mongodb"):
+            self._submit("mongodb", "store_results", self.experiment_id, {
+                "kind": "results",
+                "ts": datetime.now().isoformat(),
+                "scope": self._current_scope(),
+                "tasker_rewards": tasker_rewards or {},
+                "builder_rewards": builder_rewards or {},
+                "actions_outputs": actions_outputs or {},
+                "step": step,
+            })
+
+    # ---------------------------
+    # Spec 1.7 — Business metrics & conclusion
+    # ---------------------------
+    def log_business(
+        self,
+        price_of_resources_eur: Optional[float] = None,
+        comments: Optional[str] = None,
+        conclusion: Optional[str] = None,
+        visuals: Optional[Dict[str, str]] = None,  # name -> local path
+    ) -> None:
+        if price_of_resources_eur is not None:
+            try:
+                self.total_cost += float(price_of_resources_eur)
+            except Exception:
+                pass
+        payload = {
+            "price_of_resources_eur": price_of_resources_eur,
+            "comments": comments,
+            "conclusion": conclusion,
+            "ts": datetime.now().isoformat(),
+        }
+        if self.backends.get("mlflow"):
+            if price_of_resources_eur is not None:
+                self._submit("mlflow", "log_metrics", self._prefix_metrics({"business/price_eur": price_of_resources_eur}))
+            if visuals:
+                for name, p in visuals.items():
+                    if os.path.exists(p):
+                        try:
+                            self._submit("mlflow", "log_artifact", p, artifact_path=f"business/visuals/{name}")
+                        except Exception:
+                            pass
+            self._submit("mlflow", "log_dict", payload, artifact_file="business/summary.json")
+        if self.backends.get("mongodb"):
+            self._submit("mongodb", "store_business_metrics", self.experiment_id, payload)
+
+    # ---------------------------
+    # Spec 2 — Dataset & Versioning (DVC optional)
+    # ---------------------------
+    def log_dataset_version(
+        self,
+        name: str,
+        version: str,
+        path: Optional[str] = None,
+        meta: Optional[Dict[str, Any]] = None
+    ) -> None:
+        payload = {
+            "name": name,
+            "version": version,
+            "path": path,
+            "meta": meta or {},
+            "ts": datetime.now().isoformat(),
+        }
+        if self.backends.get("dvc") and path:
+            try:
+                dvc_info = self._exec_with_retry("dvc", "track", path, version=version)
+                payload["dvc"] = dvc_info
+            except Exception as e:
+                self.logger.warning(f"DVC track failed: {e}")
+
+        if self.backends.get("mlflow"):
+            self._submit("mlflow", "log_dict", payload, artifact_file=f"data/dataset_{name}_{version}.json")
+        if self.backends.get("mongodb"):
+            self._submit("mongodb", "store_dataset_version", self.experiment_id, payload)
+
+    # ---------------------------
+    # Final summaries & recommendations
+    # ---------------------------
+    def _finalize_results_summary(self, *, log_to_backends: bool) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {"scopes": {}}
+        for scope_key, rewards in self._tasker_rewards_sum.items():
+            n = self._tasker_rewards_n.get(scope_key, 0) or 1
+            avg = {k: v / float(n) for k, v in rewards.items()}
+            summary["scopes"].setdefault(scope_key, {})["avg_tasker_rewards"] = avg
+        for scope_key, rewards in self._builder_rewards_sum.items():
+            n = self._builder_rewards_n.get(scope_key, 0) or 1
+            avg = {k: v / float(n) for k, v in rewards.items()}
+            summary["scopes"].setdefault(scope_key, {})["avg_builder_rewards"] = avg
+
+        if log_to_backends:
+            if self.backends.get("mlflow"):
+                self._submit("mlflow", "log_dict", summary, artifact_file="results/aggregated_summary.json")
+            if self.backends.get("mongodb"):
+                self._submit("mongodb", "store_results", self.experiment_id, {"kind": "aggregated_summary", **summary})
+        return summary
+
+    def get_experiment_summary(self) -> Dict[str, Any]:
+        return {
+            "experiment_id": self.experiment_id,
+            "name": self.experiment_name,
+            "purpose": self.purpose,
+            "start_time": self.start_time.isoformat(),
+            "end_time": (self.end_time.isoformat() if self.end_time else None),
+            "steps": self.training_steps,
+            "checkpoints": self.checkpoints_saved,
+            "cost_eur": self.total_cost,
+            "lezea_config": self.lezea_config,
+            "constraints": self.constraints,
+        }
+
+    def get_run_data(self) -> Dict[str, Any]:
+        return {
+            "meta": self.get_experiment_summary(),
+            "resources": self._final_resource_summary(),
+            "population": [s.__dict__ for s in self.population_history],
+            "lineage": {k: vars(v) for k, v in self.network_lineages.items()},
+        }
+
+    def get_recommendations(self) -> List[str]:
+        recs: List[str] = []
+        if self.constraints.get("runtime_limit_sec"):
+            recs.append("Use early stopping based on delta_loss to respect runtime limits.")
+        if not self.population_history:
+            recs.append("Log population snapshots to visualize evolutionary progress.")
+        if not self.modification_trees:
+            recs.append("Record modification trees to audit network evolution.")
+        if self.backends.get("mlflow") and "mlflow" in self.backend_errors:
+            recs.append("Fix MLflow backend to enable UI and artifact tracking.")
+        return recs

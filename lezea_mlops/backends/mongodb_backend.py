@@ -1,10 +1,7 @@
-# lezea_mlops/backends/mongodb_backend.py
 from __future__ import annotations
-
 import json
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Union, Tuple
-
 try:
     import pymongo
     from pymongo import MongoClient, ASCENDING, DESCENDING
@@ -14,18 +11,15 @@ except ImportError:
     MONGODB_AVAILABLE = False
     pymongo = None  # type: ignore
 
-
 def _scope_min(scope: Optional[Dict[str, Any]]) -> Dict[str, str]:
     """Normalize scope to {level, entity_id} (or global)."""
     if not scope:
         return {"level": "global", "entity_id": "-"}
     return {"level": str(scope.get("level", "global")), "entity_id": str(scope.get("entity_id", "-"))}
 
-
 class MongoBackend:
     """
     MongoDB backend for complex data storage and hierarchical queries.
-
     Features:
     - Connection management with retry-ish timeouts
     - Optimized collections and compound indexes (scope + step)
@@ -34,30 +28,21 @@ class MongoBackend:
     - Optional TTL on noisy collections
     - NEW: LeZeA-specific collections and operations
     """
-
     def __init__(self, config):
         if not MONGODB_AVAILABLE:
             raise RuntimeError("MongoDB is not available. Install with: pip install pymongo")
-
         self.config = config
         self.mongo_config = config.get_mongodb_config()
-
-        # Connection
         self.client: Optional[MongoClient] = None
         self.database = None
         self.collections: Dict[str, Any] = {}
         self.available: bool = False
-
         self._connect()
         self._setup_collections()
         self._create_indexes()
-
         self.available = True
         print(f"✅ MongoDB backend connected: {self.mongo_config['database']}")
 
-    # ---------------------------------------------------------------------
-    # Connection & setup
-    # ---------------------------------------------------------------------
     def _connect(self) -> None:
         """Establish connection to MongoDB with sane timeouts."""
         try:
@@ -77,7 +62,6 @@ class MongoBackend:
     def _setup_collections(self) -> None:
         """Bind collection handles with configurable names."""
         coll_cfg = self.mongo_config.get("collections", {})
-        # canonical names -> mongo collection names
         names = {
             "experiments": coll_cfg.get("experiments", "experiments"),
             "modifications": coll_cfg.get("modifications", "modifications"),
@@ -85,7 +69,6 @@ class MongoBackend:
             "business": coll_cfg.get("business", "business"),
             "datasets": coll_cfg.get("datasets", "datasets"),
             "rollups": coll_cfg.get("rollups", "rollups"),
-            # NEW: LeZeA-specific collections
             "network_lineage": coll_cfg.get("network_lineage", "network_lineage"),
             "population_history": coll_cfg.get("population_history", "population_history"),
             "reward_flows": coll_cfg.get("reward_flows", "reward_flows"),
@@ -99,18 +82,14 @@ class MongoBackend:
     def _create_indexes(self) -> None:
         """Create indexes for optimal query performance and idempotency."""
         try:
-            # Experiments: general event stream (results, metadata, summaries)
             exp = self.collections["experiments"]
             exp.create_index([("experiment_id", ASCENDING), ("type", ASCENDING), ("timestamp", DESCENDING)])
             exp.create_index([("timestamp", DESCENDING)])
-            exp.create_index([("metadata.name", ASCENDING)], sparse=True)  # from store_experiment_metadata
+            exp.create_index([("metadata.name", ASCENDING)], sparse=True)
             exp.create_index([("summary.status", ASCENDING)], sparse=True)
-            # Idempotent summaries: one per experiment
             exp.create_index([("experiment_id", ASCENDING), ("type", ASCENDING)], name="exp_type_unique", unique=False)
 
-            # Modifications: includes training steps and mod trees
             mod = self.collections["modifications"]
-            # Upsert key for steps: experiment + type + step + scope
             mod.create_index(
                 [("experiment_id", ASCENDING), ("type", ASCENDING),
                  ("step_data.step", ASCENDING), ("step_data.scope.level", ASCENDING),
@@ -119,7 +98,6 @@ class MongoBackend:
                 unique=True,
                 partialFilterExpression={"type": "training_step"},
             )
-            # Upsert key for mod trees by step + scope (optional)
             mod.create_index(
                 [("experiment_id", ASCENDING), ("type", ASCENDING),
                  ("modification_data.step", ASCENDING), ("modification_data.scope.level", ASCENDING),
@@ -131,11 +109,9 @@ class MongoBackend:
             mod.create_index([("timestamp", DESCENDING)])
             mod.create_index([("experiment_id", ASCENDING), ("timestamp", DESCENDING)])
 
-            # Resources: raw samples (optionally TTL) + component queries
             res = self.collections["resources"]
             res.create_index([("experiment_id", ASCENDING), ("timestamp", DESCENDING)])
             res.create_index([("resource_data.component_type", ASCENDING)])
-            # Optional TTL for raw samples (configure in config: resources_ttl_days)
             ttl_days = int(self.mongo_config.get("resources_ttl_days", 0) or 0)
             if ttl_days > 0:
                 try:
@@ -147,37 +123,30 @@ class MongoBackend:
                 except Exception:
                     pass
 
-            # Business
             bus = self.collections["business"]
             bus.create_index([("experiment_id", ASCENDING), ("timestamp", DESCENDING)])
             bus.create_index([("business_data.cost", DESCENDING)])
 
-            # Datasets
             ds = self.collections["datasets"]
             ds.create_index([("experiment_id", ASCENDING), ("type", ASCENDING), ("timestamp", DESCENDING)])
             ds.create_index([("dataset_name", ASCENDING)], sparse=True)
 
-            # Rollups (scope/time buckets)
             roll = self.collections["rollups"]
             roll.create_index([("experiment_id", ASCENDING), ("scope.level", ASCENDING),
-                               ("scope.entity_id", ASCENDING), ("bucket", ASCENDING)],
-                              name="rollup_scope_bucket", unique=True)
+                              ("scope.entity_id", ASCENDING), ("bucket", ASCENDING)],
+                             name="rollup_scope_bucket", unique=True)
 
-            # NEW: LeZeA-specific indexes
-            # Network lineage
             lineage = self.collections["network_lineage"]
             lineage.create_index([("experiment_id", ASCENDING), ("network_id", ASCENDING)], unique=True)
             lineage.create_index([("experiment_id", ASCENDING), ("generation", ASCENDING)])
             lineage.create_index([("experiment_id", ASCENDING), ("parent_ids", ASCENDING)])
             lineage.create_index([("fitness_score", DESCENDING)])
 
-            # Population history
             pop = self.collections["population_history"]
             pop.create_index([("experiment_id", ASCENDING), ("timestamp", DESCENDING)])
             pop.create_index([("experiment_id", ASCENDING), ("generation", ASCENDING)])
             pop.create_index([("avg_fitness", DESCENDING)])
 
-            # Reward flows
             rewards = self.collections["reward_flows"]
             rewards.create_index([("experiment_id", ASCENDING), ("timestamp", DESCENDING)])
             rewards.create_index([("experiment_id", ASCENDING), ("source_id", ASCENDING), ("target_id", ASCENDING)])
@@ -185,19 +154,16 @@ class MongoBackend:
             rewards.create_index([("task_id", ASCENDING)])
             rewards.create_index([("reward_value", DESCENDING)])
 
-            # Challenge usage
             challenge = self.collections["challenge_usage"]
             challenge.create_index([("experiment_id", ASCENDING), ("challenge_id", ASCENDING), ("timestamp", DESCENDING)])
             challenge.create_index([("challenge_id", ASCENDING), ("difficulty_level", ASCENDING)])
             challenge.create_index([("usage_rate", DESCENDING)])
 
-            # Learning relevance
             relevance = self.collections["learning_relevance"]
             relevance.create_index([("experiment_id", ASCENDING), ("timestamp", DESCENDING)])
             relevance.create_index([("sample_ids", ASCENDING)])
             relevance.create_index([("avg_relevance", DESCENDING)])
 
-            # Component resources
             comp_res = self.collections["component_resources"]
             comp_res.create_index([("experiment_id", ASCENDING), ("component_id", ASCENDING), ("timestamp", DESCENDING)])
             comp_res.create_index([("component_type", ASCENDING)])
@@ -208,7 +174,6 @@ class MongoBackend:
         except Exception as e:
             print(f"⚠️ Could not create all indexes: {e}")
 
-    # Health check for tracker
     def ping(self) -> bool:
         try:
             if not self.client:
@@ -218,9 +183,6 @@ class MongoBackend:
         except Exception:
             return False
 
-    # ---------------------------------------------------------------------
-    # Original stores (idempotent where it matters)
-    # ---------------------------------------------------------------------
     def store_experiment_metadata(self, experiment_id: str, metadata: Dict[str, Any]) -> Optional[str]:
         """Append experiment metadata (non-unique stream)."""
         try:
@@ -282,7 +244,6 @@ class MongoBackend:
                 result = coll.insert_one(doc)
                 return str(result.inserted_id)
         except DuplicateKeyError:
-            # Rare race: replace on duplicate
             try:
                 coll = self.collections["modifications"]
                 scope = _scope_min(modification_data.get("scope"))
@@ -317,7 +278,6 @@ class MongoBackend:
             scope = _scope_min(step_data.get("scope"))
             step = step_data.get("step")
             if step is None:
-                # Fallback: append-only
                 doc = {
                     "experiment_id": experiment_id,
                     "timestamp": datetime.now(),
@@ -326,7 +286,6 @@ class MongoBackend:
                 }
                 result = coll.insert_one(doc)
                 return str(result.inserted_id)
-
             filt = {
                 "experiment_id": experiment_id,
                 "type": "training_step",
@@ -401,7 +360,6 @@ class MongoBackend:
             print(f"❌ Failed to store business metrics: {e}")
             return None
 
-    # ---- Data split & dataset version & generic results ----------------
     def store_data_splits(self, experiment_id: str, payload: Dict[str, Any]) -> Optional[str]:
         """Append data split counts and metadata."""
         try:
@@ -445,7 +403,6 @@ class MongoBackend:
             kind = payload.get("kind", "result_event")
             scope = _scope_min(payload.get("scope"))
             step = payload.get("step", None)
-
             doc = {
                 "experiment_id": experiment_id,
                 "timestamp": datetime.now(),
@@ -453,7 +410,6 @@ class MongoBackend:
                 **payload,
                 "scope": scope,
             }
-
             if step is not None:
                 filt = {
                     "experiment_id": experiment_id,
@@ -489,9 +445,6 @@ class MongoBackend:
             print(f"❌ Failed to store experiment summary: {e}")
             return None
 
-    # ---------------------------------------------------------------------
-    # NEW: LeZeA-specific storage methods
-    # ---------------------------------------------------------------------
     def store_network_lineage(self, experiment_id: str, network_id: str, lineage_data: Dict[str, Any]) -> Optional[str]:
         """Store or update network lineage information."""
         try:
@@ -583,23 +536,33 @@ class MongoBackend:
             print(f"❌ Failed to store component resource: {e}")
             return None
 
-    # ---------------------------------------------------------------------
-    # NEW: LeZeA-specific queries
-    # ---------------------------------------------------------------------
+    def store_environment(self, experiment_id: str, env: Dict[str, Any]) -> Optional[str]:
+        """Store environment data."""
+        try:
+            doc = {
+                "experiment_id": experiment_id,
+                "timestamp": datetime.now(),
+                "environment_data": env,
+                "type": "environment",
+            }
+            result = self.collections["experiments"].insert_one(doc)
+            print(f"🌐 Stored environment data for: {experiment_id}")
+            return str(result.inserted_id)
+        except Exception as e:
+            print(f"❌ Failed to store environment data: {e}")
+            return None
+
     def get_network_genealogy(self, experiment_id: str) -> Dict[str, Any]:
         """Get complete network genealogy tree."""
         try:
             cursor = self.collections["network_lineage"].find(
                 {"experiment_id": experiment_id}
             ).sort("generation", ASCENDING)
-            
             networks = {}
             generations = {}
-            
             for doc in cursor:
                 network_id = doc["network_id"]
                 generation = doc.get("generation", 0)
-                
                 networks[network_id] = {
                     "network_id": network_id,
                     "parent_ids": doc.get("parent_ids", []),
@@ -608,11 +571,9 @@ class MongoBackend:
                     "modification_count": doc.get("modification_count", 0),
                     "fitness_score": doc.get("fitness_score"),
                 }
-                
                 if generation not in generations:
                     generations[generation] = []
                 generations[generation].append(network_id)
-            
             return {
                 "networks": networks,
                 "generations": generations,
@@ -629,12 +590,10 @@ class MongoBackend:
             cursor = self.collections["population_history"].find(
                 {"experiment_id": experiment_id}
             ).sort("timestamp", ASCENDING)
-            
             evolution = []
             for doc in cursor:
                 doc["_id"] = str(doc.get("_id", ""))
                 evolution.append(doc)
-            
             return evolution
         except Exception as e:
             print(f"❌ Failed to get population evolution: {e}")
@@ -660,10 +619,7 @@ class MongoBackend:
                 },
                 {"$sort": {"total_flows": -1}}
             ]
-            
             flow_types = list(self.collections["reward_flows"].aggregate(pipeline))
-            
-            # Get individual network performance
             network_pipeline = [
                 {"$match": {"experiment_id": experiment_id}},
                 {
@@ -677,9 +633,7 @@ class MongoBackend:
                 },
                 {"$sort": {"total_rewards": -1}}
             ]
-            
             network_performance = list(self.collections["reward_flows"].aggregate(network_pipeline))
-            
             return {
                 "flow_type_analysis": flow_types,
                 "network_performance": network_performance,
@@ -709,10 +663,7 @@ class MongoBackend:
                 },
                 {"$sort": {"_id.challenge_id": 1, "_id.difficulty_level": 1}}
             ]
-            
             difficulty_stats = list(self.collections["challenge_usage"].aggregate(pipeline))
-            
-            # Overall challenge ranking
             challenge_pipeline = [
                 {"$match": {"experiment_id": experiment_id}},
                 {
@@ -726,9 +677,7 @@ class MongoBackend:
                 },
                 {"$sort": {"avg_usage_rate": -1}}
             ]
-            
             challenge_ranking = list(self.collections["challenge_usage"].aggregate(challenge_pipeline))
-            
             return {
                 "difficulty_analysis": difficulty_stats,
                 "challenge_ranking": challenge_ranking,
@@ -760,10 +709,7 @@ class MongoBackend:
                 },
                 {"$sort": {"timestamp": 1}}
             ]
-            
             trends = list(self.collections["learning_relevance"].aggregate(pipeline))
-            
-            # Calculate overall statistics
             if trends:
                 avg_relevance_overall = sum(t.get("avg_relevance", 0) for t in trends) / len(trends)
                 total_samples = sum(t.get("sample_count", 0) for t in trends)
@@ -772,7 +718,6 @@ class MongoBackend:
                 avg_relevance_overall = 0
                 total_samples = 0
                 total_high_relevance = 0
-            
             return {
                 "trends": trends,
                 "overall_stats": {
@@ -807,10 +752,7 @@ class MongoBackend:
                 },
                 {"$sort": {"avg_memory_mb": -1}}
             ]
-            
             component_stats = list(self.collections["component_resources"].aggregate(pipeline))
-            
-            # Individual component analysis
             individual_pipeline = [
                 {"$match": {"experiment_id": experiment_id}},
                 {
@@ -828,9 +770,7 @@ class MongoBackend:
                 },
                 {"$sort": {"avg_memory_mb": -1}}
             ]
-            
             individual_stats = list(self.collections["component_resources"].aggregate(individual_pipeline))
-            
             return {
                 "component_type_stats": component_stats,
                 "individual_component_stats": individual_stats,
@@ -847,24 +787,19 @@ class MongoBackend:
                 "experiment_id": experiment_id,
                 "type": "modification_tree"
             }).sort("timestamp", ASCENDING)
-            
             total_modifications = 0
             total_accepted = 0
             modification_types = {}
             acceptance_by_step = []
-            
             for doc in cursor:
                 mod_data = doc.get("modification_data", {})
                 modifications = mod_data.get("modifications", [])
                 stats = mod_data.get("statistics", {})
-                
                 step_accepted = stats.get("accepted_modifications", 0)
                 step_total = stats.get("total_modifications", len(modifications))
                 step_acceptance_rate = step_accepted / max(step_total, 1)
-                
                 total_modifications += step_total
                 total_accepted += step_accepted
-                
                 acceptance_by_step.append({
                     "step": mod_data.get("step"),
                     "timestamp": doc["timestamp"],
@@ -872,24 +807,17 @@ class MongoBackend:
                     "accepted_modifications": step_accepted,
                     "acceptance_rate": step_acceptance_rate
                 })
-                
-                # Track by modification type
                 for mod in modifications:
                     mod_type = mod.get("type", "unknown")
                     if mod_type not in modification_types:
                         modification_types[mod_type] = {"total": 0, "accepted": 0}
-                    
                     modification_types[mod_type]["total"] += 1
                     if mod.get("accepted", False):
                         modification_types[mod_type]["accepted"] += 1
-            
-            # Calculate acceptance rates by type
             for mod_type in modification_types:
                 stats = modification_types[mod_type]
                 stats["acceptance_rate"] = stats["accepted"] / max(stats["total"], 1)
-            
             overall_acceptance_rate = total_accepted / max(total_modifications, 1)
-            
             return {
                 "overall_stats": {
                     "total_modifications": total_modifications,
@@ -917,8 +845,6 @@ class MongoBackend:
                 "component_resources": self.get_component_resource_analysis(experiment_id),
                 "modification_analysis": self.get_modification_acceptance_analysis(experiment_id)
             }
-            
-            # Add high-level metrics
             summary["metrics"] = {
                 "total_networks": summary["network_genealogy"].get("total_networks", 0),
                 "max_generation": summary["network_genealogy"].get("max_generation", 0),
@@ -928,22 +854,17 @@ class MongoBackend:
                 "overall_acceptance_rate": summary["modification_analysis"].get("overall_stats", {}).get("overall_acceptance_rate", 0),
                 "avg_learning_relevance": summary["learning_relevance"].get("overall_stats", {}).get("avg_relevance", 0)
             }
-            
             return summary
         except Exception as e:
             print(f"❌ Failed to get LeZeA experiment summary: {e}")
             return {"error": str(e)}
 
-    # ---------------------------------------------------------------------
-    # Original queries / analytics (unchanged)
-    # ---------------------------------------------------------------------
     def get_experiment_data(self, experiment_id: str, data_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get all data across collections for an experiment."""
         try:
             query = {"experiment_id": experiment_id}
             if data_type:
                 query["type"] = data_type
-
             results: List[Dict[str, Any]] = []
             for collection_name, collection in self.collections.items():
                 cursor = collection.find(query).sort("timestamp", DESCENDING)
@@ -1053,9 +974,6 @@ class MongoBackend:
             print(f"❌ Failed to aggregate resource usage: {e}")
             return {}
 
-    # ---------------------------------------------------------------------
-    # Enhanced maintenance with LeZeA collections
-    # ---------------------------------------------------------------------
     def search_experiments(self, query_filter: Optional[Dict[str, Any]] = None, limit: int = 100) -> List[Dict[str, Any]]:
         """Search experiments based on criteria in 'experiments'."""
         try:
@@ -1167,9 +1085,6 @@ class MongoBackend:
         except Exception as e:
             print(f"❌ Failed to create backup: {e}")
 
-    # ---------------------------------------------------------------------
-    # Lifecycle
-    # ---------------------------------------------------------------------
     def close(self) -> None:
         """Close MongoDB connection."""
         if self.client:
