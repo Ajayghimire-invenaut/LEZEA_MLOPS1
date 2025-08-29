@@ -1,52 +1,25 @@
 """
-Business Cost Model for LeZeA MLOps
-===================================
+Business Cost Model for LeZeA MLOps System
 
-Purpose
--------
-Estimate and attribute **euro cost** to training runs from sampled resource usage.
-Covers spec 1.7.1 (price of resources) and provides clean per-scope breakdowns.
+This module provides a business-oriented cost estimation model for MLOps workflows,
+focusing on resource usage attribution and euro cost breakdowns. It enables
+tracking and attribution of costs to specific scopes in machine learning training runs.
 
-Design
-------
-- No third‑party deps. Pure Python.
-- Flexible: you can update the model with partial samples (GPU only, CPU only, …).
-- Scope-aware: costs can be tracked per **builder/tasker/algorithm/network/layer**.
-- Configurable rates via env vars or constructor.
+Features:
+    - Scope-aware cost tracking for components like builder/tasker/algorithm
+    - Flexible updates with partial resource usage samples
+    - Configurable pricing rates via environment variables
+    - Detailed cost component breakdowns
+    - JSON export for logging and integration
+    - No third-party dependencies (pure Python)
+    - Support for GPU, CPU, RAM, IO, egress, storage, and fixed costs
 
-Units & Assumptions
--------------------
-- Effective GPU hours: `gpu_util(%) / 100 * gpu_count * dt_seconds / 3600`.
-- Effective CPU core hours: `cpu_percent(%) / 100 * cpu_cores * dt_seconds / 3600`.
-- RAM GB-hours: `ram_gb * dt_seconds / 3600`.
-- IO GB: `(io_read_bytes + io_write_bytes) / 1e9` (decimal GB).
-- Egress GB: explicit; not derived from io bytes (often priced differently).
-- Storage GB-months: add explicitly (e.g., checkpoints in object storage).
-
-Environment Rates (defaults in brackets)
-----------------------------------------
-- `GPU_RATE_EUR_PER_HOUR` [2.00]
-- `CPU_RATE_EUR_PER_CORE_HOUR` [0.05]
-- `RAM_RATE_EUR_PER_GB_HOUR` [0.004]
-- `IO_RATE_EUR_PER_GB` [0.01]
-- `EGRESS_RATE_EUR_PER_GB` [0.06]
-- `STORAGE_RATE_EUR_PER_GB_MONTH` [0.02]
-- `GPU_MEM_RATE_EUR_PER_GB_HOUR` [0.00]  # optional, usually 0 (included in GPU price)
-
-Integration snippet (tracker)
-----------------------------
->>> from lezea_mlops.business.cost_model import CostModel
->>> cost = CostModel.from_env()
->>> # at each step: sample usage and update with dt
->>> cost.update(scope_key="tasker:T1", dt_seconds=1.0, gpu_util=65, gpu_count=1,
-...             cpu_percent=120, cpu_cores=8, ram_gb=6.5, io_read_bytes=2e6, io_write_bytes=5e6)
->>> # at the end
->>> summary = cost.summary()
->>> total_eur = summary["total_eur"]
->>> breakdown_json = cost.to_json()
-
-You can then log `breakdown_json` to MLflow & Mongo.
+Author: [Your Name/Team]
+Date: 2025-08-29
+Version: 1.0.0
+License: [Your License]
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict, field
@@ -55,12 +28,24 @@ from datetime import datetime
 import json
 import os
 
-# ------------------
-# Rate configuration
-# ------------------
 
-@dataclass
 class CostRates:
+    """
+    Configuration for resource pricing rates in euros.
+    
+    This dataclass holds the pricing rates for various compute resources.
+    Rates can be customized via environment variables or direct instantiation.
+    
+    Attributes:
+        gpu_hour_eur: Cost per GPU hour
+        cpu_core_hour_eur: Cost per CPU core hour
+        ram_gb_hour_eur: Cost per GB RAM hour
+        io_gb_eur: Cost per GB IO (read/write)
+        egress_gb_eur: Cost per GB data egress
+        storage_gb_month_eur: Cost per GB-month storage
+        gpu_mem_gb_hour_eur: Cost per GB GPU memory hour (usually 0)
+    """
+
     gpu_hour_eur: float = 2.00
     cpu_core_hour_eur: float = 0.05
     ram_gb_hour_eur: float = 0.004
@@ -71,6 +56,15 @@ class CostRates:
 
     @classmethod
     def from_env(cls) -> "CostRates":
+        """
+        Create CostRates instance from environment variables.
+        
+        Loads rates from env vars with fallbacks to default values.
+        Environment variable names match attribute names in uppercase with suffixes.
+        
+        Returns:
+            CostRates instance with loaded values
+        """
         def f(name: str, default: float) -> float:
             try:
                 return float(os.getenv(name, default))
@@ -86,12 +80,25 @@ class CostRates:
             gpu_mem_gb_hour_eur=f("GPU_MEM_RATE_EUR_PER_GB_HOUR", 0.00),
         )
 
-# -----------------
-# Running totals
-# -----------------
 
 @dataclass
 class Totals:
+    """
+    Accumulator for resource usage totals.
+    
+    Tracks cumulative resource consumption metrics that can be used
+    to compute costs based on rates.
+    
+    Attributes:
+        gpu_hours: Cumulative GPU hours
+        cpu_core_hours: Cumulative CPU core hours
+        ram_gb_hours: Cumulative RAM GB-hours
+        io_gb: Cumulative IO in GB
+        egress_gb: Cumulative egress in GB
+        storage_gb_months: Cumulative storage GB-months
+        gpu_mem_gb_hours: Cumulative GPU memory GB-hours
+        fixed_eur: Fixed one-off costs in euros
+    """
     gpu_hours: float = 0.0
     cpu_core_hours: float = 0.0
     ram_gb_hours: float = 0.0
@@ -102,6 +109,12 @@ class Totals:
     fixed_eur: float = 0.0  # one-off costs
 
     def add(self, other: "Totals") -> None:
+        """
+        Add another Totals instance to this one in-place.
+        
+        Args:
+            other: Another Totals instance to add
+        """
         self.gpu_hours += other.gpu_hours
         self.cpu_core_hours += other.cpu_core_hours
         self.ram_gb_hours += other.ram_gb_hours
@@ -111,21 +124,41 @@ class Totals:
         self.gpu_mem_gb_hours += other.gpu_mem_gb_hours
         self.fixed_eur += other.fixed_eur
 
-# -----------------
-# Main model
-# -----------------
 
 class CostModel:
+    """
+    Business cost model for estimating MLOps resource expenses.
+    
+    This class tracks resource usage across different scopes and computes
+    euro costs based on configurable rates. It supports incremental updates
+    from usage samples and provides detailed breakdowns.
+    
+    Key Features:
+        - Incremental updates from resource usage samples
+        - Scope-based tracking (e.g., per component or experiment)
+        - Automatic cost calculations for GPU, CPU, memory, etc.
+        - JSON export for logging/integration
+        - Environment variable configuration support
+        
+    Attributes:
+        rates: CostRates instance for pricing
+        _totals: Internal dictionary of scope to Totals
+        created_at: ISO timestamp of model creation
+    """
+
     def __init__(self, rates: Optional[CostRates] = None) -> None:
+        """
+        Initialize the cost model.
+        
+        Args:
+            rates: Optional custom CostRates, defaults to default rates
+        """
         self.rates = rates or CostRates()
         # Per-scope totals: key -> Totals
         self._totals: Dict[str, Totals] = {}
         # Timestamps
         self.created_at = datetime.now().isoformat()
 
-    # -------------
-    # Update API
-    # -------------
     def update(
         self,
         *,
@@ -141,13 +174,24 @@ class CostModel:
         egress_gb: float = 0.0,
         gpu_mem_mb: Optional[float] = None,
     ) -> None:
-        """Update totals using a single time slice of usage.
-
-        Provide what you have; unspecified values are ignored.
-        - gpu_util: 0..100 (percentage per-GPU average). If you have multiple GPUs, pass gpu_count.
-        - cpu_percent: 0..(100*cores) if measured as total across cores, else 0..100 with cpu_cores set.
-        - cpu_cores: physical+logical cores available (for better normalization). If None and cpu_percent>100, we infer cores = round(cpu_percent/100).
-        - gpu_mem_mb: optional, charges against gpu_mem_gb_hour_eur if non-zero.
+        """
+        Update totals using a single time slice of resource usage.
+        
+        Provide available metrics; unspecified values are ignored.
+        Effective hours are calculated based on utilization and time delta.
+        
+        Args:
+            scope_key: Scope identifier (e.g., "tasker:T1")
+            dt_seconds: Time delta in seconds for this sample
+            gpu_util: GPU utilization percentage (0-100)
+            gpu_count: Number of GPUs
+            cpu_percent: CPU utilization percentage (can exceed 100 if aggregate)
+            cpu_cores: Number of CPU cores (inferred if None and cpu_percent >100)
+            ram_gb: RAM usage in GB
+            io_read_bytes: IO read bytes
+            io_write_bytes: IO write bytes
+            egress_gb: Data egress in GB
+            gpu_mem_mb: GPU memory usage in MB
         """
         if dt_seconds <= 0:
             return
@@ -184,19 +228,38 @@ class CostModel:
         if egress_gb and egress_gb > 0:
             t.egress_gb += float(egress_gb)
 
-    # Explicit adds for storage and fixed costs
     def add_storage_gb_months(self, gb_months: float, scope_key: str = "global") -> None:
+        """
+        Add storage usage in GB-months to a scope.
+        
+        Args:
+            gb_months: Storage usage to add
+            scope_key: Scope identifier
+        """
         t = self._totals.setdefault(scope_key, Totals())
         t.storage_gb_months += max(0.0, float(gb_months))
 
     def add_fixed_cost(self, eur: float, scope_key: str = "global") -> None:
+        """
+        Add fixed one-off cost in euros to a scope.
+        
+        Args:
+            eur: Fixed cost to add
+            scope_key: Scope identifier
+        """
         t = self._totals.setdefault(scope_key, Totals())
         t.fixed_eur += max(0.0, float(eur))
 
-    # -------------
-    # Math
-    # -------------
     def _cost_components(self, totals: Totals) -> Dict[str, float]:
+        """
+        Compute cost components for given totals.
+        
+        Args:
+            totals: Totals instance to compute costs for
+            
+        Returns:
+            Dictionary of cost components in euros
+        """
         r = self.rates
         return {
             "gpu_eur": totals.gpu_hours * r.gpu_hour_eur,
@@ -210,12 +273,24 @@ class CostModel:
         }
 
     def _sum_components(self, comp: Dict[str, float]) -> float:
+        """
+        Sum cost components to get total.
+        
+        Args:
+            comp: Dictionary of cost components
+            
+        Returns:
+            Total cost in euros
+        """
         return sum(float(v) for v in comp.values())
 
-    # -------------
-    # Reports
-    # -------------
     def summary(self) -> Dict[str, Any]:
+        """
+        Generate comprehensive cost summary.
+        
+        Returns:
+            Dictionary with rates, per-scope breakdowns, and grand totals
+        """
         per_scope: Dict[str, Any] = {}
         total = Totals()
         for sk, t in self._totals.items():
@@ -238,22 +313,32 @@ class CostModel:
         return out
 
     def to_json(self) -> Dict[str, Any]:
+        """
+        Export summary as JSON-compatible dictionary.
+        
+        Returns:
+            Same as summary() method
+        """
         return self.summary()
 
-    # -------------
-    # Convenience
-    # -------------
     @classmethod
     def from_env(cls) -> "CostModel":
+        """
+        Create CostModel using rates from environment variables.
+        
+        Returns:
+            Initialized CostModel instance
+        """
         return cls(CostRates.from_env())
 
     def reset(self) -> None:
+        """
+        Reset all accumulated totals and update creation timestamp.
+        """
         self._totals.clear()
         self.created_at = datetime.now().isoformat()
 
-# -----------------
 # Minimal smoke test (optional usage example)
-# -----------------
 if __name__ == "__main__":
     cm = CostModel.from_env()
     # simulate 10 seconds at given usage
