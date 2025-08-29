@@ -1,107 +1,150 @@
 """
-PostgreSQL Backend for LeZeA MLOps
-==================================
+PostgreSQL Backend for LeZeA MLOps System
 
-Handles PostgreSQL operations for MLflow metadata storage and structured data:
-- MLflow backend store (experiments, runs, metrics, parameters)
-- Structured experiment metadata queries
-- Performance optimization for large-scale experiments
-- Data integrity and backup management
-- Advanced analytics and reporting queries
+This module provides a comprehensive PostgreSQL backend for MLflow metadata storage
+and structured data operations. It handles connection pooling, transaction management,
+advanced analytics, and database optimization for large-scale machine learning experiments.
 
-This backend provides optimized PostgreSQL operations with connection pooling,
-transaction management, and LeZeA-specific query optimizations.
+Features:
+    - MLflow backend store (experiments, runs, metrics, parameters)  
+    - Structured experiment metadata queries and analytics
+    - Performance optimization with connection pooling and custom indexes
+    - Data integrity management and backup operations
+    - Advanced reporting and statistical analysis capabilities
+    - Database health monitoring and maintenance operations
+
+
 """
 
 import json
 import time
-from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional, Tuple, Union
 from contextlib import contextmanager
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple, Union
 
+# PostgreSQL dependencies with graceful fallback
 try:
     import psycopg2
     from psycopg2 import pool, sql
+    from psycopg2.errors import DatabaseError, OperationalError
     from psycopg2.extras import RealDictCursor, execute_values
-    from psycopg2.errors import OperationalError, DatabaseError
     POSTGRES_AVAILABLE = True
 except ImportError:
     POSTGRES_AVAILABLE = False
-    psycopg2 = None
+    psycopg2 = None  # type: ignore
 
 
 class PostgresBackend:
     """
-    PostgreSQL backend for MLflow metadata and structured data storage
+    Professional PostgreSQL backend for MLflow metadata and structured data storage.
     
-    This class provides:
-    - Connection pooling for optimal performance
-    - Transaction management with rollback support
-    - Optimized queries for MLflow metadata
-    - Advanced analytics and reporting capabilities
-    - Data integrity and backup operations
-    - Performance monitoring and optimization
+    This class provides a robust, production-ready interface for PostgreSQL operations
+    with connection pooling, transaction management, and advanced query capabilities.
+    
+    Key Features:
+        - Thread-safe connection pooling for optimal performance
+        - Automatic transaction management with rollback support
+        - Optimized queries for MLflow metadata operations
+        - Advanced analytics and reporting capabilities
+        - Data integrity and backup operations
+        - Performance monitoring and database optimization
+        - Custom indexing for improved query performance
+        
+    Attributes:
+        config: Configuration object containing PostgreSQL settings
+        postgres_config: Parsed PostgreSQL configuration dictionary
+        connection_pool: Thread-safe connection pool instance
     """
-    
+
     def __init__(self, config):
         """
-        Initialize PostgreSQL backend
+        Initialize PostgreSQL backend with connection pooling and schema validation.
         
         Args:
-            config: Configuration object with PostgreSQL settings
+            config: Configuration object with get_postgres_config() method
+            
+        Raises:
+            RuntimeError: If PostgreSQL adapter is not available
+            ConnectionError: If database connection or pool creation fails
         """
         if not POSTGRES_AVAILABLE:
             raise RuntimeError(
                 "PostgreSQL adapter is not available. Install with: pip install psycopg2-binary"
             )
-        
+
         self.config = config
         self.postgres_config = config.get_postgres_config()
-        
-        # Connection pool configuration
         self.connection_pool = None
+
+        # Initialize connection infrastructure
         self._init_connection_pool()
-        
-        # Test connection
         self._test_connection()
-        
-        # Initialize MLflow schema if needed
         self._ensure_mlflow_schema()
-        
-        print(f"✅ PostgreSQL backend connected: {self.postgres_config['database']}")
-    
+
+        print(f"PostgreSQL backend connected: {self.postgres_config['database']}")
+
     def _init_connection_pool(self):
-        """Initialize PostgreSQL connection pool"""
+        """
+        Initialize PostgreSQL connection pool with production-ready settings.
+        
+        Creates a threaded connection pool with configurable min/max connections
+        and proper cursor factory for dictionary-based results.
+        
+        Raises:
+            ConnectionError: If connection pool creation fails
+        """
         try:
             self.connection_pool = psycopg2.pool.ThreadedConnectionPool(
-                minconn=1,
-                maxconn=20,
+                minconn=1,                                    # Minimum connections
+                maxconn=20,                                   # Maximum connections
                 host=self.postgres_config['host'],
                 port=self.postgres_config['port'],
                 database=self.postgres_config['database'],
                 user=self.postgres_config['user'],
                 password=self.postgres_config['password'],
-                cursor_factory=RealDictCursor
+                cursor_factory=RealDictCursor               # Enable dict-like results
             )
-            
+
         except Exception as e:
             raise ConnectionError(f"Failed to create PostgreSQL connection pool: {e}")
-    
+
     def _test_connection(self):
-        """Test PostgreSQL connection"""
+        """
+        Test PostgreSQL connection and retrieve version information.
+        
+        Performs a simple query to verify connectivity and logs database version
+        for debugging and compatibility verification.
+        
+        Raises:
+            ConnectionError: If connection test fails
+        """
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute("SELECT version();")
-                    version = cursor.fetchone()
-                    print(f"📊 PostgreSQL version: {version['version'].split(',')[0]}")
+                    version_info = cursor.fetchone()
                     
+                    # Extract major version for logging
+                    version_str = version_info['version'].split(',')[0]
+                    print(f"PostgreSQL version: {version_str}")
+
         except Exception as e:
             raise ConnectionError(f"Failed to connect to PostgreSQL: {e}")
-    
+
     @contextmanager
     def get_connection(self):
-        """Context manager for database connections"""
+        """
+        Context manager for database connections with automatic transaction handling.
+        
+        Provides connection from pool with automatic commit on success and
+        rollback on exception. Ensures proper connection cleanup.
+        
+        Yields:
+            psycopg2.connection: Database connection with RealDictCursor
+            
+        Raises:
+            Exception: Re-raises any database operation exceptions after rollback
+        """
         conn = None
         try:
             conn = self.connection_pool.getconn()
@@ -114,38 +157,48 @@ class PostgresBackend:
         finally:
             if conn:
                 self.connection_pool.putconn(conn)
-    
+
     def _ensure_mlflow_schema(self):
-        """Ensure MLflow database schema exists"""
+        """
+        Verify MLflow database schema exists and create performance indexes.
+        
+        Checks for required MLflow tables and creates custom indexes for
+        improved query performance. Provides guidance if schema is missing.
+        """
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    # Check if MLflow tables exist
+                    # Check for essential MLflow tables
                     cursor.execute("""
                         SELECT table_name 
                         FROM information_schema.tables 
                         WHERE table_schema = 'public' 
                         AND table_name IN ('experiments', 'runs', 'metrics', 'params', 'tags')
                     """)
-                    
+
                     existing_tables = [row['table_name'] for row in cursor.fetchall()]
-                    
+
                     if len(existing_tables) < 5:
-                        print("⚠️ MLflow tables not found. Run 'mlflow db upgrade' to initialize schema.")
+                        print("MLflow tables not found. Run 'mlflow db upgrade' to initialize schema.")
                     else:
-                        print("✅ MLflow schema verified")
+                        print("MLflow schema verified")
                         self._create_custom_indexes()
-                        
+
         except Exception as e:
-            print(f"⚠️ Could not verify MLflow schema: {e}")
-    
+            print(f"Could not verify MLflow schema: {e}")
+
     def _create_custom_indexes(self):
-        """Create custom indexes for better performance"""
+        """
+        Create custom database indexes for optimized query performance.
+        
+        Adds indexes specifically designed for common MLflow query patterns
+        including time-based filtering, experiment grouping, and key-based lookups.
+        """
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    # Custom indexes for better query performance
-                    indexes = [
+                    # Performance-optimized indexes for common query patterns
+                    performance_indexes = [
                         "CREATE INDEX IF NOT EXISTS idx_runs_experiment_start_time ON runs(experiment_id, start_time DESC);",
                         "CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);",
                         "CREATE INDEX IF NOT EXISTS idx_metrics_run_key_step ON metrics(run_uuid, key, step);",
@@ -154,33 +207,43 @@ class PostgresBackend:
                         "CREATE INDEX IF NOT EXISTS idx_experiments_name ON experiments(name);",
                         "CREATE INDEX IF NOT EXISTS idx_runs_name ON runs(name);"
                     ]
-                    
-                    for index_sql in indexes:
+
+                    created_count = 0
+                    for index_sql in performance_indexes:
                         try:
                             cursor.execute(index_sql)
+                            created_count += 1
                         except Exception as e:
-                            print(f"⚠️ Could not create index: {e}")
-                    
-                    print("📊 Custom indexes created")
-                    
+                            print(f"Could not create index: {e}")
+
+                    print(f"Custom indexes created: {created_count}/{len(performance_indexes)}")
+
         except Exception as e:
-            print(f"⚠️ Could not create custom indexes: {e}")
-    
+            print(f"Could not create custom indexes: {e}")
+
+    # Experiment Analysis and Reporting Methods
+
     def get_experiment_summary(self, experiment_id: str = None, experiment_name: str = None) -> Dict[str, Any]:
         """
-        Get comprehensive experiment summary
+        Generate comprehensive experiment summary with run statistics.
+        
+        Provides detailed analytics including run counts by status, timing information,
+        and performance metrics for experiment evaluation.
         
         Args:
-            experiment_id: MLflow experiment ID
-            experiment_name: Experiment name
-        
+            experiment_id: MLflow experiment ID for lookup
+            experiment_name: Alternative experiment name for lookup
+            
         Returns:
-            Dictionary with experiment summary
+            Dictionary containing experiment summary and statistics
+            
+        Raises:
+            ValueError: If neither experiment_id nor experiment_name provided
         """
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    # Build query based on provided identifiers
+                    # Determine query condition based on provided identifier
                     if experiment_id:
                         exp_condition = "e.experiment_id = %s"
                         exp_param = experiment_id
@@ -189,8 +252,8 @@ class PostgresBackend:
                         exp_param = experiment_name
                     else:
                         raise ValueError("Either experiment_id or experiment_name must be provided")
-                    
-                    # Get experiment info and run statistics
+
+                    # Comprehensive experiment analytics query
                     query = f"""
                         SELECT 
                             e.experiment_id,
@@ -210,107 +273,112 @@ class PostgresBackend:
                         WHERE {exp_condition}
                         GROUP BY e.experiment_id, e.name, e.creation_time, e.last_update_time
                     """
-                    
+
                     cursor.execute(query, (exp_param,))
                     result = cursor.fetchone()
-                    
+
                     if not result:
                         return {'error': 'Experiment not found'}
-                    
-                    # Convert to dictionary and format timestamps
+
+                    # Format response with proper timestamp conversion
                     summary = dict(result)
-                    
-                    # Format timestamps
-                    if summary['creation_time']:
-                        summary['creation_time'] = datetime.fromtimestamp(summary['creation_time'] / 1000).isoformat()
-                    if summary['last_update_time']:
-                        summary['last_update_time'] = datetime.fromtimestamp(summary['last_update_time'] / 1000).isoformat()
-                    if summary['first_run_start']:
-                        summary['first_run_start'] = datetime.fromtimestamp(summary['first_run_start'] / 1000).isoformat()
-                    if summary['last_run_end']:
-                        summary['last_run_end'] = datetime.fromtimestamp(summary['last_run_end'] / 1000).isoformat()
-                    
-                    # Convert duration to seconds
+
+                    # Convert MLflow timestamps (milliseconds) to ISO format
+                    timestamp_fields = ['creation_time', 'last_update_time', 'first_run_start', 'last_run_end']
+                    for field in timestamp_fields:
+                        if summary[field]:
+                            summary[field] = datetime.fromtimestamp(summary[field] / 1000).isoformat()
+
+                    # Convert duration from milliseconds to seconds
                     if summary['avg_duration_ms']:
                         summary['avg_duration_seconds'] = summary['avg_duration_ms'] / 1000
-                    
+
                     return summary
-                    
+
         except Exception as e:
-            print(f"❌ Failed to get experiment summary: {e}")
+            print(f"Failed to get experiment summary: {e}")
             return {'error': str(e)}
-    
+
     def get_run_metrics_history(self, run_id: str, metrics: List[str] = None) -> Dict[str, List]:
         """
-        Get metrics history for a specific run
+        Retrieve time-series metrics history for a specific run.
+        
+        Returns complete metrics evolution over time with optional filtering
+        by metric names for focused analysis.
         
         Args:
-            run_id: MLflow run ID
-            metrics: List of metric names to retrieve (None for all)
-        
+            run_id: MLflow run UUID
+            metrics: Optional list of metric names to filter (None for all)
+            
         Returns:
-            Dictionary with metrics history
+            Dictionary with metric names as keys and time-series data as values
         """
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    # Build query with optional metric filter
+                    # Build dynamic query with optional metric filtering
                     base_query = """
                         SELECT key, value, timestamp, step
                         FROM metrics 
                         WHERE run_uuid = %s
                     """
-                    
-                    params = [run_id]
-                    
+
+                    query_params = [run_id]
+
+                    # Add metric name filter if specified
                     if metrics:
                         placeholders = ','.join(['%s'] * len(metrics))
                         base_query += f" AND key IN ({placeholders})"
-                        params.extend(metrics)
-                    
+                        query_params.extend(metrics)
+
                     base_query += " ORDER BY key, step"
-                    
-                    cursor.execute(base_query, params)
+
+                    cursor.execute(base_query, query_params)
                     rows = cursor.fetchall()
-                    
-                    # Group by metric name
+
+                    # Group metrics by name for time-series structure
                     metrics_history = {}
                     for row in rows:
                         metric_name = row['key']
                         if metric_name not in metrics_history:
                             metrics_history[metric_name] = []
-                        
+
+                        # Format timestamp and add to series
                         metrics_history[metric_name].append({
                             'value': row['value'],
                             'timestamp': datetime.fromtimestamp(row['timestamp'] / 1000).isoformat(),
                             'step': row['step']
                         })
-                    
+
                     return metrics_history
-                    
+
         except Exception as e:
-            print(f"❌ Failed to get run metrics history: {e}")
+            print(f"Failed to get run metrics history: {e}")
             return {}
-    
-    def get_experiment_leaderboard(self, experiment_id: str, metric_name: str, 
+
+    def get_experiment_leaderboard(self, experiment_id: str, metric_name: str,
                                   limit: int = 10, ascending: bool = False) -> List[Dict]:
         """
-        Get experiment leaderboard sorted by a specific metric
+        Generate experiment leaderboard ranked by specified metric.
+        
+        Creates a ranked list of top-performing runs based on a target metric
+        with comprehensive run metadata for performance analysis.
         
         Args:
             experiment_id: MLflow experiment ID
-            metric_name: Metric name to sort by
+            metric_name: Target metric for ranking
             limit: Number of top runs to return
-            ascending: Sort order (False for descending)
-        
+            ascending: Sort order (False for descending/higher is better)
+            
         Returns:
-            List of top run dictionaries
+            List of ranked run dictionaries with performance metadata
         """
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    order_direction = "ASC" if ascending else "DESC"
-                    
+                    sort_direction = "ASC" if ascending else "DESC"
+
+                    # Comprehensive leaderboard query with timing data
                     query = f"""
                         SELECT 
                             r.run_uuid,
@@ -325,57 +393,66 @@ class PostgresBackend:
                         WHERE r.experiment_id = %s 
                         AND m.key = %s
                         AND r.status = 'FINISHED'
-                        ORDER BY m.value {order_direction}
+                        ORDER BY m.value {sort_direction}
                         LIMIT %s
                     """
-                    
+
                     cursor.execute(query, (experiment_id, metric_name, limit))
                     rows = cursor.fetchall()
-                    
+
+                    # Format leaderboard with rankings and metadata
                     leaderboard = []
-                    for i, row in enumerate(rows, 1):
+                    for rank, row in enumerate(rows, 1):
                         entry = dict(row)
-                        entry['rank'] = i
+                        entry['rank'] = rank
                         entry['metric_name'] = metric_name
-                        
-                        # Format timestamps
+
+                        # Convert timestamps from MLflow format
                         if entry['start_time']:
                             entry['start_time'] = datetime.fromtimestamp(entry['start_time'] / 1000).isoformat()
                         if entry['end_time']:
                             entry['end_time'] = datetime.fromtimestamp(entry['end_time'] / 1000).isoformat()
-                        
-                        # Convert duration to seconds
+
+                        # Convert duration to seconds for readability
                         if entry['duration_ms']:
                             entry['duration_seconds'] = entry['duration_ms'] / 1000
-                        
+
                         leaderboard.append(entry)
-                    
+
                     return leaderboard
-                    
+
         except Exception as e:
-            print(f"❌ Failed to get experiment leaderboard: {e}")
+            print(f"Failed to get experiment leaderboard: {e}")
             return []
-    
-    def search_runs_advanced(self, experiment_ids: List[str] = None, 
+
+    def search_runs_advanced(self, experiment_ids: List[str] = None,
                            filter_conditions: Dict[str, Any] = None,
                            order_by: str = None, limit: int = 100) -> List[Dict]:
         """
-        Advanced run search with complex filtering
+        Execute advanced run search with complex multi-table filtering.
+        
+        Supports sophisticated filtering across metrics, parameters, tags,
+        and run metadata with dynamic query construction.
         
         Args:
-            experiment_ids: List of experiment IDs to search
-            filter_conditions: Dictionary of filter conditions
-            order_by: Column to order by
+            experiment_ids: List of experiment IDs to search within
+            filter_conditions: Complex filter dictionary supporting:
+                - metrics: List of (name, operator, value) tuples
+                - params: List of (name, operator, value) tuples  
+                - tags: List of (name, operator, value) tuples
+                - status: Run status filter
+                - start_time_after/before: Date range filters
+            order_by: Column name for result ordering
             limit: Maximum number of results
-        
+            
         Returns:
-            List of run dictionaries
+            List of run dictionaries matching filter criteria
         """
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    # Build base query
-                    query = """
+                    # Dynamic query construction
+                    base_query = """
                         SELECT DISTINCT
                             r.run_uuid,
                             r.experiment_id,
@@ -386,110 +463,135 @@ class PostgresBackend:
                             r.artifact_uri
                         FROM runs r
                     """
-                    
+
                     joins = []
                     where_conditions = []
-                    params = []
-                    
-                    # Add experiment filter
+                    query_params = []
+
+                    # Add experiment ID filtering
                     if experiment_ids:
                         placeholders = ','.join(['%s'] * len(experiment_ids))
                         where_conditions.append(f"r.experiment_id IN ({placeholders})")
-                        params.extend(experiment_ids)
-                    
-                    # Add filter conditions
+                        query_params.extend(experiment_ids)
+
+                    # Process complex filter conditions
                     if filter_conditions:
-                        # Metric filters
-                        if 'metrics' in filter_conditions:
-                            for i, (metric_name, operator, value) in enumerate(filter_conditions['metrics']):
-                                alias = f"m{i}"
-                                joins.append(f"LEFT JOIN metrics {alias} ON r.run_uuid = {alias}.run_uuid")
-                                where_conditions.append(f"{alias}.key = %s AND {alias}.value {operator} %s")
-                                params.extend([metric_name, value])
-                        
-                        # Parameter filters
-                        if 'params' in filter_conditions:
-                            for i, (param_name, operator, value) in enumerate(filter_conditions['params']):
-                                alias = f"p{i}"
-                                joins.append(f"LEFT JOIN params {alias} ON r.run_uuid = {alias}.run_uuid")
-                                where_conditions.append(f"{alias}.key = %s AND {alias}.value {operator} %s")
-                                params.extend([param_name, value])
-                        
-                        # Tag filters
-                        if 'tags' in filter_conditions:
-                            for i, (tag_name, operator, value) in enumerate(filter_conditions['tags']):
-                                alias = f"t{i}"
-                                joins.append(f"LEFT JOIN tags {alias} ON r.run_uuid = {alias}.run_uuid")
-                                where_conditions.append(f"{alias}.key = %s AND {alias}.value {operator} %s")
-                                params.extend([tag_name, value])
-                        
-                        # Status filter
-                        if 'status' in filter_conditions:
-                            where_conditions.append("r.status = %s")
-                            params.append(filter_conditions['status'])
-                        
-                        # Date range filter
-                        if 'start_time_after' in filter_conditions:
-                            where_conditions.append("r.start_time >= %s")
-                            params.append(int(filter_conditions['start_time_after'].timestamp() * 1000))
-                        
-                        if 'start_time_before' in filter_conditions:
-                            where_conditions.append("r.start_time <= %s")
-                            params.append(int(filter_conditions['start_time_before'].timestamp() * 1000))
-                    
-                    # Combine query parts
+                        self._build_filter_conditions(
+                            filter_conditions, joins, where_conditions, query_params
+                        )
+
+                    # Assemble complete query
+                    complete_query = base_query
                     if joins:
-                        query += " " + " ".join(joins)
-                    
+                        complete_query += " " + " ".join(joins)
                     if where_conditions:
-                        query += " WHERE " + " AND ".join(where_conditions)
-                    
-                    # Add ordering
+                        complete_query += " WHERE " + " AND ".join(where_conditions)
+
+                    # Add ordering and limit
                     if order_by:
-                        query += f" ORDER BY r.{order_by} DESC"
+                        complete_query += f" ORDER BY r.{order_by} DESC"
                     else:
-                        query += " ORDER BY r.start_time DESC"
-                    
-                    # Add limit
-                    query += f" LIMIT {limit}"
-                    
-                    cursor.execute(query, params)
+                        complete_query += " ORDER BY r.start_time DESC"
+                    complete_query += f" LIMIT {limit}"
+
+                    cursor.execute(complete_query, query_params)
                     rows = cursor.fetchall()
-                    
-                    # Format results
+
+                    # Format results with proper timestamp conversion
                     runs = []
                     for row in rows:
                         run_data = dict(row)
-                        
-                        # Format timestamps
+
+                        # Convert MLflow timestamps
                         if run_data['start_time']:
                             run_data['start_time'] = datetime.fromtimestamp(run_data['start_time'] / 1000).isoformat()
                         if run_data['end_time']:
                             run_data['end_time'] = datetime.fromtimestamp(run_data['end_time'] / 1000).isoformat()
-                        
+
                         runs.append(run_data)
-                    
+
                     return runs
-                    
+
         except Exception as e:
-            print(f"❌ Failed to search runs: {e}")
+            print(f"Failed to search runs: {e}")
             return []
-    
+
+    def _build_filter_conditions(self, filter_conditions: Dict[str, Any], 
+                               joins: List[str], where_conditions: List[str], 
+                               query_params: List[Any]):
+        """
+        Build dynamic SQL filter conditions from filter specification.
+        
+        Helper method for constructing complex WHERE clauses and JOINs
+        based on filter_conditions dictionary.
+        
+        Args:
+            filter_conditions: Filter specification dictionary
+            joins: List to append JOIN clauses to
+            where_conditions: List to append WHERE conditions to
+            query_params: List to append query parameters to
+        """
+        # Metric-based filtering
+        if 'metrics' in filter_conditions:
+            for i, (metric_name, operator, value) in enumerate(filter_conditions['metrics']):
+                alias = f"m{i}"
+                joins.append(f"LEFT JOIN metrics {alias} ON r.run_uuid = {alias}.run_uuid")
+                where_conditions.append(f"{alias}.key = %s AND {alias}.value {operator} %s")
+                query_params.extend([metric_name, value])
+
+        # Parameter-based filtering
+        if 'params' in filter_conditions:
+            for i, (param_name, operator, value) in enumerate(filter_conditions['params']):
+                alias = f"p{i}"
+                joins.append(f"LEFT JOIN params {alias} ON r.run_uuid = {alias}.run_uuid")
+                where_conditions.append(f"{alias}.key = %s AND {alias}.value {operator} %s")
+                query_params.extend([param_name, value])
+
+        # Tag-based filtering
+        if 'tags' in filter_conditions:
+            for i, (tag_name, operator, value) in enumerate(filter_conditions['tags']):
+                alias = f"t{i}"
+                joins.append(f"LEFT JOIN tags {alias} ON r.run_uuid = {alias}.run_uuid")
+                where_conditions.append(f"{alias}.key = %s AND {alias}.value {operator} %s")
+                query_params.extend([tag_name, value])
+
+        # Status filtering
+        if 'status' in filter_conditions:
+            where_conditions.append("r.status = %s")
+            query_params.append(filter_conditions['status'])
+
+        # Date range filtering
+        if 'start_time_after' in filter_conditions:
+            timestamp_ms = int(filter_conditions['start_time_after'].timestamp() * 1000)
+            where_conditions.append("r.start_time >= %s")
+            query_params.append(timestamp_ms)
+
+        if 'start_time_before' in filter_conditions:
+            timestamp_ms = int(filter_conditions['start_time_before'].timestamp() * 1000)
+            where_conditions.append("r.start_time <= %s")
+            query_params.append(timestamp_ms)
+
+    # Statistical Analysis Methods
+
     def get_metric_statistics(self, experiment_id: str, metric_name: str) -> Dict[str, Any]:
         """
-        Get statistical summary for a metric across all runs in an experiment
+        Calculate comprehensive statistical summary for experiment metrics.
+        
+        Computes descriptive statistics including mean, standard deviation,
+        quartiles, and distribution characteristics for metric analysis.
         
         Args:
             experiment_id: MLflow experiment ID
-            metric_name: Name of the metric
-        
+            metric_name: Target metric for analysis
+            
         Returns:
-            Dictionary with metric statistics
+            Dictionary with statistical measures and distribution data
         """
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    query = """
+                    # Comprehensive statistical analysis query
+                    statistical_query = """
                         SELECT 
                             COUNT(*) as run_count,
                             AVG(m.value) as mean_value,
@@ -505,10 +607,10 @@ class PostgresBackend:
                         AND m.key = %s
                         AND r.status = 'FINISHED'
                     """
-                    
-                    cursor.execute(query, (experiment_id, metric_name))
+
+                    cursor.execute(statistical_query, (experiment_id, metric_name))
                     result = cursor.fetchone()
-                    
+
                     if result and result['run_count'] > 0:
                         stats = dict(result)
                         stats['metric_name'] = metric_name
@@ -516,26 +618,29 @@ class PostgresBackend:
                         return stats
                     else:
                         return {'error': 'No data found for metric'}
-                    
+
         except Exception as e:
-            print(f"❌ Failed to get metric statistics: {e}")
+            print(f"Failed to get metric statistics: {e}")
             return {'error': str(e)}
-    
+
     def get_parameter_analysis(self, experiment_id: str) -> Dict[str, Any]:
         """
-        Analyze parameter usage across all runs in an experiment
+        Analyze parameter usage patterns across experiment runs.
+        
+        Examines parameter distribution, uniqueness, and types to provide
+        insights into hyperparameter exploration patterns.
         
         Args:
             experiment_id: MLflow experiment ID
-        
+            
         Returns:
-            Dictionary with parameter analysis
+            Dictionary with parameter usage analysis and type inference
         """
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    # Get parameter usage statistics
-                    query = """
+                    # Parameter usage analysis query
+                    analysis_query = """
                         SELECT 
                             p.key as param_name,
                             COUNT(*) as usage_count,
@@ -547,70 +652,87 @@ class PostgresBackend:
                         GROUP BY p.key
                         ORDER BY usage_count DESC
                     """
-                    
-                    cursor.execute(query, (experiment_id,))
+
+                    cursor.execute(analysis_query, (experiment_id,))
                     rows = cursor.fetchall()
-                    
-                    parameter_analysis = {
+
+                    # Build comprehensive parameter analysis
+                    analysis_result = {
                         'experiment_id': experiment_id,
                         'total_parameters': len(rows),
                         'parameters': []
                     }
-                    
+
                     for row in rows:
                         param_info = dict(row)
-                        
-                        # Analyze parameter type
-                        sample_values = param_info['all_values'][:5]  # First 5 values
+
+                        # Analyze parameter characteristics
+                        sample_values = param_info['all_values'][:5]  # Sample for type inference
                         param_info['sample_values'] = sample_values
                         param_info['parameter_type'] = self._infer_parameter_type(sample_values)
-                        
-                        parameter_analysis['parameters'].append(param_info)
-                    
-                    return parameter_analysis
-                    
+
+                        analysis_result['parameters'].append(param_info)
+
+                    return analysis_result
+
         except Exception as e:
-            print(f"❌ Failed to get parameter analysis: {e}")
+            print(f"Failed to get parameter analysis: {e}")
             return {'error': str(e)}
-    
+
     def _infer_parameter_type(self, values: List[str]) -> str:
-        """Infer parameter type from sample values"""
+        """
+        Infer parameter data type from sample values.
+        
+        Analyzes sample parameter values to determine likely data type
+        for better understanding of hyperparameter space.
+        
+        Args:
+            values: List of sample parameter values as strings
+            
+        Returns:
+            Inferred parameter type: 'numeric', 'boolean', 'categorical', 'text', or 'unknown'
+        """
         if not values:
             return 'unknown'
-        
-        # Check if all values are numeric
+
+        # Test for numeric type
         try:
             [float(v) for v in values]
             return 'numeric'
-        except ValueError:
+        except (ValueError, TypeError):
             pass
-        
-        # Check if all values are boolean-like
-        boolean_values = {'true', 'false', '1', '0', 'yes', 'no'}
-        if all(v.lower() in boolean_values for v in values):
+
+        # Test for boolean-like values
+        boolean_indicators = {'true', 'false', '1', '0', 'yes', 'no'}
+        if all(v.lower() in boolean_indicators for v in values):
             return 'boolean'
-        
-        # Check if values look like categorical
+
+        # Test for categorical (limited unique values)
         if len(set(values)) < len(values) or len(values) <= 5:
             return 'categorical'
-        
+
         return 'text'
-    
+
+    # Database Management Methods
+
     def cleanup_old_runs(self, experiment_id: str, keep_runs: int = 100) -> int:
         """
-        Clean up old runs keeping only the most recent ones
+        Clean up old experiment runs while preserving recent ones.
+        
+        Removes older runs and associated data (metrics, parameters, tags)
+        based on start time, keeping only the most recent runs.
         
         Args:
             experiment_id: MLflow experiment ID
-            keep_runs: Number of runs to keep
-        
+            keep_runs: Number of recent runs to preserve
+            
         Returns:
-            Number of runs deleted
+            Number of runs successfully deleted
         """
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    # Get old run IDs to delete
+                    # Identify old runs to delete
                     cursor.execute("""
                         SELECT run_uuid
                         FROM runs
@@ -618,104 +740,123 @@ class PostgresBackend:
                         ORDER BY start_time DESC
                         OFFSET %s
                     """, (experiment_id, keep_runs))
-                    
-                    old_runs = [row['run_uuid'] for row in cursor.fetchall()]
-                    
-                    if not old_runs:
+
+                    old_run_ids = [row['run_uuid'] for row in cursor.fetchall()]
+
+                    if not old_run_ids:
                         return 0
-                    
-                    # Delete old runs and related data
-                    placeholders = ','.join(['%s'] * len(old_runs))
-                    
-                    # Delete metrics
-                    cursor.execute(f"DELETE FROM metrics WHERE run_uuid IN ({placeholders})", old_runs)
+
+                    # Execute cascading deletion
+                    placeholders = ','.join(['%s'] * len(old_run_ids))
+
+                    # Delete associated data first (foreign key constraints)
+                    cursor.execute(f"DELETE FROM metrics WHERE run_uuid IN ({placeholders})", old_run_ids)
                     metrics_deleted = cursor.rowcount
-                    
-                    # Delete params
-                    cursor.execute(f"DELETE FROM params WHERE run_uuid IN ({placeholders})", old_runs)
+
+                    cursor.execute(f"DELETE FROM params WHERE run_uuid IN ({placeholders})", old_run_ids)
                     params_deleted = cursor.rowcount
-                    
-                    # Delete tags
-                    cursor.execute(f"DELETE FROM tags WHERE run_uuid IN ({placeholders})", old_runs)
+
+                    cursor.execute(f"DELETE FROM tags WHERE run_uuid IN ({placeholders})", old_run_ids)
                     tags_deleted = cursor.rowcount
-                    
-                    # Delete runs
-                    cursor.execute(f"DELETE FROM runs WHERE run_uuid IN ({placeholders})", old_runs)
+
+                    # Delete run records
+                    cursor.execute(f"DELETE FROM runs WHERE run_uuid IN ({placeholders})", old_run_ids)
                     runs_deleted = cursor.rowcount
-                    
-                    print(f"🧹 Cleaned up {runs_deleted} old runs ({metrics_deleted} metrics, {params_deleted} params, {tags_deleted} tags)")
+
+                    print(f"Cleaned up {runs_deleted} old runs ({metrics_deleted} metrics, {params_deleted} params, {tags_deleted} tags)")
                     return runs_deleted
-                    
+
         except Exception as e:
-            print(f"❌ Failed to cleanup old runs: {e}")
+            print(f"Failed to cleanup old runs: {e}")
             return 0
-    
+
     def backup_experiment(self, experiment_id: str, backup_file: str):
         """
-        Create a backup of experiment data
+        Create comprehensive backup of experiment data.
+        
+        Exports all experiment-related data including runs, metrics,
+        parameters, and tags to JSON format for backup or migration.
         
         Args:
-            experiment_id: MLflow experiment ID
-            backup_file: Path to save backup
+            experiment_id: MLflow experiment ID to backup
+            backup_file: File path for backup output
         """
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
+                    # Initialize backup structure
                     backup_data = {
                         'backup_timestamp': datetime.now().isoformat(),
                         'experiment_id': experiment_id,
                         'tables': {}
                     }
-                    
-                    # Backup experiment info
+
+                    # Backup experiment metadata
                     cursor.execute("SELECT * FROM experiments WHERE experiment_id = %s", (experiment_id,))
                     backup_data['tables']['experiments'] = [dict(row) for row in cursor.fetchall()]
-                    
-                    # Backup runs
+
+                    # Backup all runs
                     cursor.execute("SELECT * FROM runs WHERE experiment_id = %s", (experiment_id,))
                     runs = [dict(row) for row in cursor.fetchall()]
                     backup_data['tables']['runs'] = runs
-                    
+
+                    # Backup related data if runs exist
                     run_ids = [run['run_uuid'] for run in runs]
-                    
                     if run_ids:
-                        placeholders = ','.join(['%s'] * len(run_ids))
-                        
-                        # Backup metrics
-                        cursor.execute(f"SELECT * FROM metrics WHERE run_uuid IN ({placeholders})", run_ids)
-                        backup_data['tables']['metrics'] = [dict(row) for row in cursor.fetchall()]
-                        
-                        # Backup params
-                        cursor.execute(f"SELECT * FROM params WHERE run_uuid IN ({placeholders})", run_ids)
-                        backup_data['tables']['params'] = [dict(row) for row in cursor.fetchall()]
-                        
-                        # Backup tags
-                        cursor.execute(f"SELECT * FROM tags WHERE run_uuid IN ({placeholders})", run_ids)
-                        backup_data['tables']['tags'] = [dict(row) for row in cursor.fetchall()]
-                    
-                    # Save backup
-                    with open(backup_file, 'w') as f:
+                        self._backup_run_data(cursor, run_ids, backup_data)
+
+                    # Write backup to file
+                    with open(backup_file, 'w', encoding='utf-8') as f:
                         json.dump(backup_data, f, indent=2, default=str)
-                    
+
                     total_records = sum(len(table_data) for table_data in backup_data['tables'].values())
-                    print(f"💾 Created backup with {total_records} records: {backup_file}")
-                    
+                    print(f"Created backup with {total_records} records: {backup_file}")
+
         except Exception as e:
-            print(f"❌ Failed to backup experiment: {e}")
-    
+            print(f"Failed to backup experiment: {e}")
+
+    def _backup_run_data(self, cursor, run_ids: List[str], backup_data: Dict):
+        """
+        Backup run-related data (metrics, parameters, tags).
+        
+        Helper method for comprehensive run data backup including
+        all associated metadata and measurements.
+        
+        Args:
+            cursor: Database cursor for queries
+            run_ids: List of run UUIDs to backup
+            backup_data: Backup structure to populate
+        """
+        placeholders = ','.join(['%s'] * len(run_ids))
+
+        # Backup metrics
+        cursor.execute(f"SELECT * FROM metrics WHERE run_uuid IN ({placeholders})", run_ids)
+        backup_data['tables']['metrics'] = [dict(row) for row in cursor.fetchall()]
+
+        # Backup parameters
+        cursor.execute(f"SELECT * FROM params WHERE run_uuid IN ({placeholders})", run_ids)
+        backup_data['tables']['params'] = [dict(row) for row in cursor.fetchall()]
+
+        # Backup tags
+        cursor.execute(f"SELECT * FROM tags WHERE run_uuid IN ({placeholders})", run_ids)
+        backup_data['tables']['tags'] = [dict(row) for row in cursor.fetchall()]
+
     def get_database_stats(self) -> Dict[str, Any]:
         """
-        Get database statistics and health information
+        Generate comprehensive database statistics and health information.
+        
+        Provides detailed metrics about database size, table statistics,
+        connection counts, and overall system health for monitoring.
         
         Returns:
-            Dictionary with database statistics
+            Dictionary containing database statistics and health metrics
         """
         try:
             with self.get_connection() as conn:
                 with conn.cursor() as cursor:
-                    stats = {}
-                    
-                    # Table sizes
+                    database_stats = {}
+
+                    # Analyze table sizes and storage usage
                     cursor.execute("""
                         SELECT 
                             schemaname,
@@ -727,45 +868,107 @@ class PostgresBackend:
                         AND tablename IN ('experiments', 'runs', 'metrics', 'params', 'tags')
                         ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC
                     """)
-                    
-                    stats['table_sizes'] = [dict(row) for row in cursor.fetchall()]
-                    
-                    # Record counts
-                    tables = ['experiments', 'runs', 'metrics', 'params', 'tags']
-                    stats['record_counts'] = {}
-                    
-                    for table in tables:
-                        cursor.execute(f"SELECT COUNT(*) as count FROM {table}")
-                        stats['record_counts'][table] = cursor.fetchone()['count']
-                    
-                    # Database size
+
+                    database_stats['table_sizes'] = [dict(row) for row in cursor.fetchall()]
+
+                    # Generate record count statistics
+                    mlflow_tables = ['experiments', 'runs', 'metrics', 'params', 'tags']
+                    database_stats['record_counts'] = {}
+
+                    for table_name in mlflow_tables:
+                        cursor.execute(f"SELECT COUNT(*) as count FROM {table_name}")
+                        result = cursor.fetchone()
+                        database_stats['record_counts'][table_name] = result['count']
+
+                    # Calculate overall database size
                     cursor.execute("""
                         SELECT pg_size_pretty(pg_database_size(current_database())) as database_size,
                                pg_database_size(current_database()) as database_size_bytes
                     """)
-                    db_size = cursor.fetchone()
-                    stats['database_size'] = dict(db_size)
-                    
-                    # Connection info
-                    cursor.execute("SELECT COUNT(*) as active_connections FROM pg_stat_activity WHERE datname = current_database()")
-                    stats['active_connections'] = cursor.fetchone()['active_connections']
-                    
-                    return stats
-                    
+                    size_info = cursor.fetchone()
+                    database_stats['database_size'] = dict(size_info)
+
+                    # Monitor active connections
+                    cursor.execute("""
+                        SELECT COUNT(*) as active_connections 
+                        FROM pg_stat_activity 
+                        WHERE datname = current_database()
+                    """)
+                    connection_info = cursor.fetchone()
+                    database_stats['active_connections'] = connection_info['active_connections']
+
+                    return database_stats
+
         except Exception as e:
-            print(f"❌ Failed to get database stats: {e}")
+            print(f"Failed to get database stats: {e}")
             return {'error': str(e)}
-    
+
+    def ping(self) -> bool:
+        """
+        Test database connectivity and responsiveness.
+        
+        Returns:
+            True if database is accessible and responsive, False otherwise
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT 1")
+                    return cursor.fetchone() is not None
+        except Exception:
+            return False
+
+    def execute_custom_query(self, query: str, params: List[Any] = None) -> List[Dict[str, Any]]:
+        """
+        Execute custom SQL query with parameter binding.
+        
+        Provides interface for executing arbitrary SQL queries with
+        proper parameter binding for security and flexibility.
+        
+        Args:
+            query: SQL query string with parameter placeholders
+            params: Optional list of parameters for query binding
+            
+        Returns:
+            List of result dictionaries
+            
+        Note:
+            Use with caution - ensure queries are safe and validated
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(query, params or [])
+                    
+                    # Handle different query types
+                    if cursor.description:
+                        # SELECT queries return results
+                        return [dict(row) for row in cursor.fetchall()]
+                    else:
+                        # Non-SELECT queries return row count
+                        return [{'affected_rows': cursor.rowcount}]
+
+        except Exception as e:
+            print(f"Failed to execute custom query: {e}")
+            return [{'error': str(e)}]
+
+    # Connection Management and Cleanup
+
     def close(self):
-        """Close all connections in the pool"""
+        """
+        Close all database connections and cleanup resources.
+        
+        Properly shuts down the connection pool and releases
+        all database connections for clean application shutdown.
+        """
         if self.connection_pool:
             self.connection_pool.closeall()
-            print("🔌 PostgreSQL connection pool closed")
-    
+            print("PostgreSQL connection pool closed")
+
     def __enter__(self):
-        """Context manager entry"""
+        """Context manager entry point."""
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit"""
+        """Context manager exit with automatic resource cleanup."""
         self.close()
