@@ -387,53 +387,10 @@ class MLflowBackend:
             return f"{base}/#/experiments/{self.current_experiment_id}/runs/{self.current_run_id}"
         return self.get_experiment_url()
 
-    def delete_run(self, run_id: str) -> None:
-        try:
-            mlflow.delete_run(run_id)
-            print(f"🗑️ Deleted run: {run_id}")
-        except Exception as e:  # pragma: no cover
-            print(f"❌ Failed to delete run: {e}")
-
-    def get_experiment_summary(self) -> Dict[str, Any]:
-        try:
-            if not self.current_experiment_id:
-                return {}
-            runs = self.search_runs()
-            if not runs:
-                return {"experiment_id": self.current_experiment_id, "run_count": 0, "mlflow_ui_url": self.get_experiment_url()}
-            completed = [r for r in runs if r.get("status") == "FINISHED"]
-            failed = [r for r in runs if r.get("status") == "FAILED"]
-            running = [r for r in runs if r.get("status") == "RUNNING"]
-            total_duration = 0
-            for r in runs:
-                st = r.get("start_time")
-                et = r.get("end_time")
-                if st and et:
-                    total_duration += (int(et) - int(st))
-            return {
-                "experiment_id": self.current_experiment_id,
-                "experiment_name": self.current_experiment,
-                "run_count": len(runs),
-                "completed_runs": len(completed),
-                "failed_runs": len(failed),
-                "running_runs": len(running),
-                "total_duration": total_duration,
-                "mlflow_ui_url": self.get_experiment_url(),
-            }
-        except Exception as e:  # pragma: no cover
-            print(f"❌ Failed to get experiment summary: {e}")
-            return {}
-
-    def cleanup(self) -> None:
-        try:
-            if self.current_run is not None:
-                self.end_run("KILLED")
-            print("🧹 Cleaned up MLflow backend")
-        except Exception as e:  # pragma: no cover
-            print(f"⚠️ Error during cleanup: {e}")
-
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.cleanup()
+        if self.current_run is not None:
+            self.end_run("KILLED")
+        print("🧹 Cleaned up MLflow backend")

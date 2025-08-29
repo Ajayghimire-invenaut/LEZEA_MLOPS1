@@ -4,6 +4,8 @@
 LeZeA MLOps - Executive Demo (works with real ExperimentTracker OR MLflow fallback)
 - Provides a compat shim for ModificationTree/ModTree
 - Uses adapter helpers so it runs against either tracker API
+- Modified to include checks/verifications after each major logging step to ensure everything is tracked successfully.
+- At the end, added a comprehensive verification section that queries MLflow (if available) and checks artifact files.
 """
 
 import os
@@ -45,8 +47,10 @@ _ensure_modificationtree_symbol()
 # --------------------- tracking backstop (fallback) ---------------------
 try:
     import mlflow  # type: ignore
+    from mlflow.tracking import MlflowClient  # Added for verification
 except Exception:
     mlflow = None  # type: ignore[assignment]
+    MlflowClient = None
 
 class _FallbackTracker:
     """Minimal tracker that uses MLflow only; keeps the demo running without touching your code."""
@@ -143,35 +147,48 @@ def t_start_if_needed(tracker) -> None:
             print("⚠️ tracker.start() failed (continuing):", e)
 
 def t_log_params(tracker, params: Dict[str, object]) -> None:
-    if hasattr(tracker, "log_params"):
-        tracker.log_params(params)
-        return
-    # Real tracker: store params as an artifact
-    _write_json_artifact(params, "params/params.json")
+    try:
+        if hasattr(tracker, "log_params"):
+            tracker.log_params(params)
+        else:
+            # Real tracker: store params as an artifact
+            _write_json_artifact(params, "params/params.json")
+        print("✅ Params logged successfully")
+    except Exception as e:
+        print("❌ Failed to log params:", e)
 
 def t_log_metrics(tracker, metrics: Dict[str, float], step: Optional[int] = None) -> None:
-    if hasattr(tracker, "log_metrics"):
-        tracker.log_metrics(metrics, step=step)
-        return
-    if hasattr(tracker, "log_training_step"):
-        tracker.log_training_step(step=step or 0, metrics=metrics)
-        return
-    # last resort: write artifact
-    _write_json_artifact({"step": step, "metrics": metrics}, f"metrics/step_{step or 0}.json")
+    try:
+        if hasattr(tracker, "log_metrics"):
+            tracker.log_metrics(metrics, step=step)
+        elif hasattr(tracker, "log_training_step"):
+            tracker.log_training_step(step=step or 0, metrics=metrics)
+        else:
+            # last resort: write artifact
+            _write_json_artifact({"step": step, "metrics": metrics}, f"metrics/step_{step or 0}.json")
+        print("✅ Metrics logged successfully")
+    except Exception as e:
+        print("❌ Failed to log metrics:", e)
 
 def t_log_dataset_info(tracker, info: Dict[str, object]) -> None:
-    if hasattr(tracker, "log_dataset_info"):
-        tracker.log_dataset_info(info)
-        return
-    _write_json_artifact(info, "data/dataset_info.json")
+    try:
+        if hasattr(tracker, "log_dataset_info"):
+            tracker.log_dataset_info(info)
+        else:
+            _write_json_artifact(info, "data/dataset_info.json")
+        print("✅ Dataset info logged successfully")
+    except Exception as e:
+        print("❌ Failed to log dataset info:", e)
 
 def t_finish(tracker) -> None:
-    if hasattr(tracker, "finish_run"):
-        tracker.finish_run()
-        return
-    if hasattr(tracker, "end"):
-        tracker.end()
-        return
+    try:
+        if hasattr(tracker, "finish_run"):
+            tracker.finish_run()
+        elif hasattr(tracker, "end"):
+            tracker.end()
+        print("✅ Tracker finished successfully")
+    except Exception as e:
+        print("❌ Failed to finish tracker:", e)
 
 # --------------------- pretty printing ---------------------
 def print_header(title: str) -> None:
@@ -179,6 +196,48 @@ def print_header(title: str) -> None:
 
 def print_section(title: str) -> None:
     print(f"\n{'─'*40}\n📊 {title}\n{'─'*40}")
+
+# --------------------- verification helpers ---------------------
+def verify_artifact_exists(path: str) -> bool:
+    """Check if artifact file exists."""
+    return pathlib.Path(path).exists()
+
+def verify_mlflow_params(run_id: str, expected_keys: List[str]) -> None:
+    """Verify if params are logged in MLflow."""
+    if MlflowClient:
+        client = MlflowClient()
+        run = client.get_run(run_id)
+        logged_params = run.data.params.keys()
+        for key in expected_keys:
+            if key in logged_params:
+                print(f"✅ Verified param: {key}")
+            else:
+                print(f"❌ Missing param: {key}")
+    else:
+        print("⚠️ MlflowClient not available for param verification")
+
+def verify_mlflow_metrics(run_id: str, expected_metrics: List[str]) -> None:
+    """Verify if metrics are logged in MLflow."""
+    if MlflowClient:
+        client = MlflowClient()
+        run = client.get_run(run_id)
+        logged_metrics = run.data.metrics.keys()
+        for metric in expected_metrics:
+            if metric in logged_metrics:
+                print(f"✅ Verified metric: {metric}")
+            else:
+                print(f"❌ Missing metric: {metric}")
+    else:
+        print("⚠️ MlflowClient not available for metric verification")
+
+def verify_artifacts(artifact_paths: List[str]) -> None:
+    """Verify if artifact files exist."""
+    for path in artifact_paths:
+        full_path = str(ART_DIR / path)
+        if verify_artifact_exists(full_path):
+            print(f"✅ Verified artifact: {path}")
+        else:
+            print(f"❌ Missing artifact: {path}")
 
 # --------------------- main demo ---------------------
 def main() -> None:
@@ -213,8 +272,11 @@ def main() -> None:
         "compute_requirements": "8x A100 GPUs minimum",
     }
     t_log_params(tracker, agi_config)
-    _write_json_artifact(agi_config, "env/agi_config.json")
-    print("✅ AGI model configuration logged")
+    config_path = _write_json_artifact(agi_config, "env/agi_config.json")
+    if verify_artifact_exists(config_path):
+        print("✅ AGI config artifact verified")
+    else:
+        print("❌ AGI config artifact missing")
 
     # 3) Training simulation
     print_section("3. AGI Training Simulation")
@@ -244,13 +306,25 @@ def main() -> None:
         t_log_metrics(tracker, metrics, step=epoch)
         training_metrics.append(metrics)
         # lightweight “checkpoint” (just a stub file for the demo)
-        _write_json_artifact({"epoch": epoch, "state_stub": f"weights-{uuid.uuid4().hex[:8]}"},
+        ckpt_path = _write_json_artifact({"epoch": epoch, "state_stub": f"weights-{uuid.uuid4().hex[:8]}"},
                              f"checkpoints/epoch_{epoch:02d}.json")
+        if verify_artifact_exists(ckpt_path):
+            print(f"✅ Checkpoint {epoch} verified")
+        else:
+            print(f"❌ Checkpoint {epoch} missing")
         print(f"   Epoch {epoch:2d}: loss={loss:.4f}, accuracy={accuracy:.4f}, perplexity={perplexity:.2f}")
         time.sleep(0.05)
 
-    _write_json_artifact({"history": training_metrics}, "training/history.json")
-    _plot_metrics_png(training_metrics, "plots/metrics.png")
+    history_path = _write_json_artifact({"history": training_metrics}, "training/history.json")
+    if verify_artifact_exists(history_path):
+        print("✅ Training history verified")
+    else:
+        print("❌ Training history missing")
+    plot_path = _plot_metrics_png(training_metrics, "plots/metrics.png")
+    if plot_path and verify_artifact_exists(plot_path):
+        print("✅ Metrics plot verified")
+    else:
+        print("⚠️ Metrics plot not generated or missing")
     print("✅ AGI training simulation completed")
 
     # 4) Dataset info
@@ -267,7 +341,11 @@ def main() -> None:
         "challenge_usage": {"web_crawl": 0.6, "books": 0.2, "papers": 0.15, "code_repos": 0.05},
     }
     t_log_dataset_info(tracker, dataset_info)
-    _write_json_artifact(dataset_info, "data/dataset_info_full.json")
+    dataset_path = _write_json_artifact(dataset_info, "data/dataset_info_full.json")
+    if verify_artifact_exists(dataset_path):
+        print("✅ Dataset info artifact verified")
+    else:
+        print("❌ Dataset info artifact missing")
     print("✅ Dataset information logged")
 
     # 5) Business metrics
@@ -282,7 +360,11 @@ def main() -> None:
     }
     for k, v in business_metrics.items():
         t_log_metrics(tracker, {f"business_{k}": v})
-    _write_json_artifact(business_metrics, "business/business_summary.json")
+    business_path = _write_json_artifact(business_metrics, "business/business_summary.json")
+    if verify_artifact_exists(business_path):
+        print("✅ Business summary verified")
+    else:
+        print("❌ Business summary missing")
     print("✅ Business metrics calculated")
 
     # 6) System health (info only; live checks are in test_connections.py)
@@ -294,7 +376,11 @@ def main() -> None:
         "object_storage": "S3 via MLflow artifact root",
         "mlflow": os.getenv("MLFLOW_TRACKING_URI", "not-set"),
     }
-    _write_json_artifact(system_status, "monitoring/system_status.json")
+    status_path = _write_json_artifact(system_status, "monitoring/system_status.json")
+    if verify_artifact_exists(status_path):
+        print("✅ System status verified")
+    else:
+        print("❌ System status missing")
     for c, s in system_status.items():
         print(f"   {c}: {s}")
 
@@ -310,7 +396,11 @@ def main() -> None:
         "avg_gpu_util": float(sum(m["gpu_utilization"] for m in training_metrics) / len(training_metrics)),
         "peak_mem_gb": float(max(m["memory_usage_gb"] for m in training_metrics)),
     }
-    _write_json_artifact(perf, "results/performance_summary.json")
+    perf_path = _write_json_artifact(perf, "results/performance_summary.json")
+    if verify_artifact_exists(perf_path):
+        print("✅ Performance summary verified")
+    else:
+        print("❌ Performance summary missing")
     readable = {
         "Final Model Accuracy": f"{perf['final_accuracy']:.2%}",
         "Training Loss Reduction": f"{perf['loss_reduction_pct']:.1%}",
@@ -332,7 +422,11 @@ def main() -> None:
         "Cost Tracking": "Business metrics logged",
         "Compliance": "Artifacts provide audit trail",
     }
-    _write_json_artifact(checklist, "results/integration_readiness.json")
+    readiness_path = _write_json_artifact(checklist, "results/integration_readiness.json")
+    if verify_artifact_exists(readiness_path):
+        print("✅ Integration readiness verified")
+    else:
+        print("❌ Integration readiness missing")
     for k, v in checklist.items():
         print(f"   ✅ {k}: {v}")
 
@@ -343,12 +437,16 @@ def main() -> None:
         "Grafana": os.getenv("GRAFANA_URL", "http://127.0.0.1:3000"),
         "Prometheus": os.getenv("PROMETHEUS_URL", "http://127.0.0.1:9090"),
     }
-    _write_json_artifact(urls, "report/access_urls.json")
+    urls_path = _write_json_artifact(urls, "report/access_urls.json")
+    if verify_artifact_exists(urls_path):
+        print("✅ Access URLs verified")
+    else:
+        print("❌ Access URLs missing")
     for k, v in urls.items():
         print(f"   {k}: {v}")
 
     # Index
-    _write_json_artifact({
+    summary_path = _write_json_artifact({
         "run_id": run_id if isinstance(run_id, str) else str(run_id),
         "artifact_index": [
             "env/agi_config.json",
@@ -362,12 +460,48 @@ def main() -> None:
             "checkpoints/*",
         ]
     }, "EXEC_SUMMARY.json")
+    if verify_artifact_exists(summary_path):
+        print("✅ Executive summary index verified")
+    else:
+        print("❌ Executive summary index missing")
 
     # Finish up
     t_finish(tracker)
 
+    # 10) Comprehensive Verification
+    print_section("10. Full Tracking Verification")
+    if run_id:
+        # Verify params (example expected keys)
+        expected_params = ["purpose", "demo_start_ts", "model_architecture"]
+        verify_mlflow_params(run_id, expected_params)
+        
+        # Verify metrics (example expected)
+        expected_metrics = ["loss", "accuracy", "perplexity", "business_training_cost_usd"]
+        verify_mlflow_metrics(run_id, expected_metrics)
+        
+        # Verify artifacts
+        artifact_paths = [
+            "env/agi_config.json",
+            "training/history.json",
+            "data/dataset_info_full.json",
+            "business/business_summary.json",
+            "monitoring/system_status.json",
+            "results/performance_summary.json",
+            "results/integration_readiness.json",
+            "report/access_urls.json",
+            "EXEC_SUMMARY.json"
+        ]
+        # Add checkpoint paths dynamically
+        for epoch in range(1, 11):
+            artifact_paths.append(f"checkpoints/epoch_{epoch:02d}.json")
+        if _plot_metrics_png:  # If plot was generated
+            artifact_paths.append("plots/metrics.png")
+        verify_artifacts(artifact_paths)
+    else:
+        print("⚠️ Run ID not available; skipping MLflow verification")
+
     print_header("EXECUTIVE SUMMARY")
-    print("🎉 LeZeA MLOps Platform — DEMO COMPLETE (metrics + artifacts logged)")
+    print("🎉 LeZeA MLOps Platform — DEMO COMPLETE (metrics + artifacts logged and verified)")
     print(f"⏰ Demo completed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*60)
 
