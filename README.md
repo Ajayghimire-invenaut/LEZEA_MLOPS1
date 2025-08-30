@@ -4,10 +4,6 @@
 
 A comprehensive, enterprise-grade MLOps platform designed specifically for training and managing large language models like LeZeA. Built for 2-person teams who need professional-grade experiment tracking, monitoring, and deployment capabilities without the complexity of massive platforms.
 
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![MLflow](https://img.shields.io/badge/MLflow-2.0+-orange.svg)](https://mlflow.org/)
-[![Prometheus](https://img.shields.io/badge/Prometheus-Compatible-red.svg)](https://prometheus.io/)
 
 ## 🚀 Quick Start
 

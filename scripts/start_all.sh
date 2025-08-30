@@ -4,7 +4,7 @@
 #
 # Starts services in order:
 # 1. Infrastructure (PostgreSQL, MongoDB)
-# 2. Storage (MinIO/S3)
+# 2. Storage (S3 preferred; MinIO only if no S3)
 # 3. MLflow server
 # 4. Monitoring (Prometheus, Node Exporter, GPU Exporter, Grafana)
 # 5. Health checks
@@ -52,6 +52,12 @@ declare -A SERVICE_PORTS=(
   [grafana]=3000
 )
 
+# --- Helpers -----------------------------------------------------------------
+# Detect if artifacts are configured to use AWS S3 (preferred)
+is_s3_artifacts() {
+  [[ -n "${MLFLOW_ARTIFACT_URI:-}" && "${MLFLOW_ARTIFACT_URI}" == s3://* ]]
+}
+
 # --- Usage -------------------------------------------------------------------
 usage() {
   cat <<EOF
@@ -62,7 +68,7 @@ Manage LeZeA MLOps services
 Options:
   --quick             Skip validation checks
   --no-monitoring     Skip Prometheus/Grafana/exporters
-  --no-storage        Skip MinIO
+  --no-storage        Skip MinIO/S3 (not recommended)
   --services LIST     Comma-separated subset to manage
   --wait-time N       Seconds to wait between starts (default: 5)
   --verbose           Verbose shell tracing
@@ -144,7 +150,6 @@ check_service_health() {
       fi
       ;;
     mlflow)
-      # MLflow has no /health; root responds with HTML
       command -v curl >/dev/null 2>&1 && \
         curl -fsS --connect-timeout 2 "http://localhost:${port}/" >/dev/null 2>&1 && return 0
       ;;
@@ -153,6 +158,8 @@ check_service_health() {
         curl -fsS "http://localhost:${port}/-/healthy" >/dev/null 2>&1 && return 0
       ;;
     minio)
+      # If S3 is configured, MinIO is intentionally skipped; report 'unavailable' by returning 1
+      if is_s3_artifacts; then return 1; fi
       command -v curl >/dev/null 2>&1 && \
         curl -fsS "http://localhost:${port}/minio/health/live" >/dev/null 2>&1 && return 0
       ;;
@@ -165,7 +172,6 @@ check_service_health() {
         curl -fsS "http://localhost:${port}/metrics" >/dev/null 2>&1 && return 0
       ;;
   esac
-  # fallback: port listening
   check_port "$port"
 }
 
@@ -231,6 +237,11 @@ start_mongodb() {
 
 # --- Start MinIO -------------------------------------------------------------
 start_minio() {
+  if is_s3_artifacts; then
+    log_info "S3 artifacts configured (MLFLOW_ARTIFACT_URI=${MLFLOW_ARTIFACT_URI}); skipping MinIO"
+    SERVICE_STATUS[minio]=skipped
+    return 0
+  fi
   log_service "Starting MinIO..."
   if check_service_health minio; then log_warn "MinIO already running"; SERVICE_STATUS[minio]=running; return 0; fi
   if ! command -v minio >/dev/null 2>&1; then log_warn "MinIO not found, skipping"; SERVICE_STATUS[minio]=skipped; return 0; fi
@@ -264,14 +275,23 @@ start_mlflow() {
       log_error "mlflow CLI not found (pip install mlflow)"; SERVICE_STATUS[mlflow]=failed; return 1
     fi
     local store_dir="${MLFLOW_STORE_DIR:-$PROJECT_ROOT/data/mlflow}"
-    local artifacts_dir="${MLFLOW_ARTIFACT_DIR:-$PROJECT_ROOT/artifacts/mlflow}"
-    mkdir -p "$store_dir" "$artifacts_dir"
+    mkdir -p "$store_dir"
     local backend_uri="${MLFLOW_BACKEND_URI:-sqlite:///$store_dir/mlflow.db}"
-    local artifact_uri="${MLFLOW_ARTIFACT_URI:-$artifacts_dir}"
+
+    # Prefer S3 if provided; else local artifacts dir
+    local default_local_artifacts="${MLFLOW_ARTIFACT_DIR:-$PROJECT_ROOT/artifacts/mlflow}"
+    local artifact_uri="${MLFLOW_ARTIFACT_URI:-$default_local_artifacts}"
+    if [[ "$artifact_uri" == s3://* ]]; then
+      log_info "Using S3 for MLflow artifacts: $artifact_uri"
+    else
+      mkdir -p "$artifact_uri"
+      log_info "Using local dir for MLflow artifacts: $artifact_uri"
+    fi
+
     nohup mlflow server \
       --backend-store-uri "$backend_uri" \
       --default-artifact-root "$artifact_uri" \
-      --host 0.0.0.0 --port "${SERVICE_PORTS[mlflow]}" \
+      --host "${MLFLOW_HOST:-0.0.0.0}" --port "${MLFLOW_PORT:-${SERVICE_PORTS[mlflow]}}" \
       >"$LOG_DIR/mlflow.log" 2>&1 & echo $! >"$PID_DIR/mlflow.pid"
   fi
 
@@ -440,7 +460,10 @@ show_status() {
 health_check() {
   log_info "Comprehensive health check..."
   local all_healthy=true
-  local services=(postgresql mongodb minio mlflow prometheus node_exporter gpu_exporter grafana)
+  local services=(postgresql mongodb mlflow prometheus node_exporter gpu_exporter grafana)
+  if ! is_s3_artifacts; then
+    services=(postgresql mongodb minio mlflow prometheus node_exporter gpu_exporter grafana)
+  fi
 
   echo; echo "Service Health Status:"; echo "====================="
   for s in "${services[@]}"; do
@@ -451,6 +474,30 @@ health_check() {
       all_healthy=false
     fi
   done
+
+  # Quick S3 access check (only if S3 is configured)
+  if is_s3_artifacts; then
+    echo; echo "S3 Check:"; echo "========"
+    python3 - <<'PY' >/dev/null 2>&1
+import os, sys
+try:
+  import boto3
+  from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
+  uri=os.environ.get("MLFLOW_ARTIFACT_URI","")
+  if uri.startswith("s3://"):
+    bucket=uri.split("/",3)[2]
+    s3=boto3.client("s3", region_name=os.getenv("AWS_DEFAULT_REGION","eu-central-1"))
+    s3.list_objects_v2(Bucket=bucket, MaxKeys=1)
+except Exception:
+  sys.exit(1)
+PY
+    if [[ $? -eq 0 ]]; then
+      printf "%-15s: ${GREEN}✓ HEALTHY${NC}\n" "s3 (${MLFLOW_ARTIFACT_URI})"
+    else
+      printf "%-15s: ${RED}✗ UNHEALTHY${NC}\n" "s3 (${MLFLOW_ARTIFACT_URI})"
+      all_healthy=false
+    fi
+  fi
 
   echo; echo "System Resources:"; echo "================"
   if command -v top >/dev/null 2>&1; then
@@ -483,7 +530,14 @@ start_all_services() {
   local wait_time="${LEZEA_WAIT_TIME:-5}"
   local services=("$@")
   if [[ ${#services[@]} -eq 0 ]]; then
-    services=(postgresql mongodb minio mlflow node_exporter gpu_exporter prometheus grafana)
+    services=(postgresql mongodb)
+    if ! is_s3_artifacts; then
+      services+=(minio)
+    else
+      log_info "Detected S3 artifacts; MinIO will be disabled"
+    fi
+    services+=(mlflow)
+    [[ "${no_monitoring:-false}" != "true" ]] && services+=(node_exporter gpu_exporter prometheus grafana)
   fi
 
   log_info "Starting services: ${services[*]}"
@@ -505,7 +559,9 @@ start_all_services() {
   echo "MLflow UI:       http://localhost:${SERVICE_PORTS[mlflow]}"
   echo "Prometheus UI:   http://localhost:${SERVICE_PORTS[prometheus]}"
   echo "Grafana UI:      http://localhost:${SERVICE_PORTS[grafana]} (admin/${GRAFANA_ADMIN_PASSWORD:-admin123})"
-  echo "MinIO Console:   http://localhost:9001 (user: ${MINIO_ROOT_USER:-minioadmin})"
+  if ! is_s3_artifacts; then
+    echo "MinIO Console:   http://localhost:9001 (user: ${MINIO_ROOT_USER:-minioadmin})"
+  fi
   echo; echo "Logs: $LOG_DIR"; echo "PIDs: $PID_DIR"
 }
 
@@ -544,10 +600,27 @@ PY
   done
 
   [[ -z "${POSTGRES_PASSWORD:-}" ]] && log_warn "POSTGRES_PASSWORD not set (using default)"
-  [[ -z "${AWS_ACCESS_KEY_ID:-}" ]] && log_warn "AWS_ACCESS_KEY_ID not set (S3 may be disabled)"
+  if is_s3_artifacts; then
+    [[ -z "${AWS_ACCESS_KEY_ID:-}" ]] && log_warn "AWS_ACCESS_KEY_ID not set (S3 may fail)"
+    [[ -z "${AWS_SECRET_ACCESS_KEY:-}" ]] && log_warn "AWS_SECRET_ACCESS_KEY not set (S3 may fail)"
+  fi
 
   local avail_kb; avail_kb=$(df "$PROJECT_ROOT" | awk 'NR==2{print $4}')
   if [[ ${avail_kb:-0} -lt 1000000 ]]; then log_warn "Low disk space: $((avail_kb/1024)) MB"; fi
+
+  # Light S3 check (optional)
+  if is_s3_artifacts; then
+    python3 - <<'PY' >/dev/null 2>&1 || log_warn "S3 check failed (verify AWS creds, region, bucket)"
+import os
+import boto3
+from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
+uri=os.environ.get("MLFLOW_ARTIFACT_URI","")
+if uri.startswith("s3://"):
+    bucket=uri.split("/",3)[2]
+    s3=boto3.client("s3", region_name=os.getenv("AWS_DEFAULT_REGION","eu-central-1"))
+    s3.list_objects_v2(Bucket=bucket, MaxKeys=1)
+PY
+  fi
 
   if (( issues > 0 )); then log_warn "Validation found $issues issue(s)"; return 1
   else log_success "Environment validation passed"; return 0
@@ -589,11 +662,20 @@ main() {
     IFS=',' read -r -a services <<<"$services_list"
   else
     services=(postgresql mongodb)
-    [[ "$no_storage" != "true" ]] && services+=(minio)
+    if [[ "$no_storage" != "true" ]]; then
+      if ! is_s3_artifacts; then
+        services+=(minio)
+      else
+        log_info "S3 artifacts detected; MinIO excluded from startup"
+      fi
+    fi
     services+=(mlflow)
-    [[ "$no_monitoring" != "true" ]] && services+=(node_exporter gpu_exporter prometheus grafana)
+    if [[ "$no_monitoring" != "true" ]]; then
+      services+=(node_exporter gpu_exporter prometheus grafana)
+    fi
   fi
   export LEZEA_WAIT_TIME="$wait_time"
+  export no_monitoring="$no_monitoring"  # used in start_all_services default path
 
   if [[ "$quick_start" != "true" ]] && [[ "$command" == "start" || "$command" == "restart" ]]; then
     validate_environment || { log_warn "Validation failed; continuing (use --quick to skip)"; }
