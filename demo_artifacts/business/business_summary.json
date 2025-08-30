@@ -1,8 +1,0 @@
-{
-  "training_cost_usd": 2500000.0,
-  "compute_hours": 50000.0,
-  "energy_consumption_kwh": 125000.0,
-  "carbon_footprint_kg": 62500.0,
-  "expected_roi_percent": 450.0,
-  "time_to_market_days": 90.0
-}

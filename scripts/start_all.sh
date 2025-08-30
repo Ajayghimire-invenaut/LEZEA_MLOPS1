@@ -23,6 +23,19 @@ if [[ -f "$PROJECT_ROOT/.env" ]]; then
   set +a
 fi
 
+# --- Env normalization (after sourcing .env) ---------------------------------
+# Accept either MLFLOW_ARTIFACT_ROOT or MLFLOW_ARTIFACT_URI
+export MLFLOW_ARTIFACT_URI="${MLFLOW_ARTIFACT_URI:-${MLFLOW_ARTIFACT_ROOT:-}}"
+
+# Prefer AWS_DEFAULT_REGION but fall back to AWS_REGION if set
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-${AWS_REGION:-eu-central-1}}"
+
+# DVC remote URL should be a full s3:// URL (not just bucket name)
+export DVC_REMOTE_URL="${DVC_REMOTE_URL:-}"
+export DVC_REGION="${DVC_REGION:-$AWS_DEFAULT_REGION}"
+# DVC_ENDPOINT_URL is optional (useful for MinIO or explicit regional endpoints)
+export DVC_ENDPOINT_URL="${DVC_ENDPOINT_URL:-}"
+
 LOG_DIR="$PROJECT_ROOT/logs"
 PID_DIR="$LOG_DIR/pids"
 SERVICES_DIR="$PROJECT_ROOT/services"
@@ -53,9 +66,102 @@ declare -A SERVICE_PORTS=(
 )
 
 # --- Helpers -----------------------------------------------------------------
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
 # Detect if artifacts are configured to use AWS S3 (preferred)
 is_s3_artifacts() {
   [[ -n "${MLFLOW_ARTIFACT_URI:-}" && "${MLFLOW_ARTIFACT_URI}" == s3://* ]]
+}
+
+# --- DVC helpers --------------------------------------------------------------
+dvc_bootstrap() {
+  if ! has_cmd dvc; then
+    log_warn "DVC not installed; skipping DVC bootstrap"; return 0
+  fi
+  if [[ -z "$DVC_REMOTE_URL" ]]; then
+    log_info "DVC_REMOTE_URL not set; skipping DVC bootstrap"; return 0
+  fi
+  if [[ "${DVC_REMOTE_URL}" != s3://* ]]; then
+    log_error "DVC_REMOTE_URL must start with s3:// (got: ${DVC_REMOTE_URL})"
+    return 1
+  fi
+
+  # Initialize DVC repo (idempotent)
+  if ! dvc status >/dev/null 2>&1; then
+    log_info "Initializing DVC repository..."
+    dvc init -q || true
+  fi
+
+  # Ensure a clean 'storage' remote with URL from env (idempotent)
+  if dvc config remote.storage.url >/dev/null 2>&1; then
+    dvc remote modify storage url "${DVC_REMOTE_URL}" || true
+  else
+    dvc remote add -f storage "${DVC_REMOTE_URL}" || true
+  fi
+
+  # Region / endpointurl (optional)
+  [[ -n "$DVC_REGION" ]] && dvc remote modify storage region "$DVC_REGION" || true
+  [[ -n "$DVC_ENDPOINT_URL" ]] && dvc remote modify storage endpointurl "$DVC_ENDPOINT_URL" || true
+
+  dvc remote default storage || true
+
+  # Show clean values (never includes "(default)")
+  local def name url
+  def=$(dvc config core.remote 2>/dev/null || echo "")
+  name="${def:-storage}"
+  url=$(dvc config "remote.${name}.url" 2>/dev/null || echo "")
+  log_success "DVC remote set: ${name} -> ${url}"
+}
+
+dvc_health_check() {
+  if ! has_cmd dvc; then
+    printf "%-15s: ${YELLOW}⚠ skipped (no dvc)${NC}\n" "DVC"
+    return 0
+  fi
+
+  local name url
+  name=$(dvc config core.remote 2>/dev/null || echo "")
+  if [[ -z "$name" ]]; then
+    printf "%-15s: ${YELLOW}⚠ no default${NC}\n" "DVC"
+    return 1
+  fi
+  url=$(dvc config "remote.${name}.url" 2>/dev/null || echo "")
+  if [[ -z "$url" ]]; then
+    printf "%-15s: ${RED}✗ missing url${NC}\n" "DVC"
+    return 1
+  fi
+
+  # Only validate s3:// remotes (local/ssh/etc. are out of scope here)
+  if [[ "$url" == s3://* ]]; then
+    # Extract bucket for a head check
+    local bucket
+    bucket="${url#s3://}"; bucket="${bucket%%/*}"
+
+    python3 - <<PY >/dev/null 2>&1
+import os, sys
+try:
+    import boto3
+    from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
+    bucket="${bucket}"
+    region=os.getenv("DVC_REGION") or os.getenv("AWS_DEFAULT_REGION") or "eu-central-1"
+    endpoint=os.getenv("DVC_ENDPOINT_URL") or None
+    session=boto3.session.Session(region_name=region)
+    s3=session.client("s3", endpoint_url=endpoint) if endpoint else session.client("s3")
+    s3.head_bucket(Bucket=bucket)
+except Exception:
+    sys.exit(1)
+PY
+    if [[ $? -eq 0 ]]; then
+      printf "%-15s: ${GREEN}✓ remote=${url}${NC}\n" "DVC"
+      return 0
+    else
+      printf "%-15s: ${RED}✗ remote=${url}${NC}\n" "DVC"
+      return 1
+    fi
+  else
+    printf "%-15s: ${GREEN}✓ remote=${url}${NC}\n" "DVC"
+    return 0
+  fi
 }
 
 # --- Usage -------------------------------------------------------------------
@@ -475,28 +581,47 @@ health_check() {
     fi
   done
 
-  # Quick S3 access check (only if S3 is configured)
-  if is_s3_artifacts; then
-    echo; echo "S3 Check:"; echo "========"
-    python3 - <<'PY' >/dev/null 2>&1
+  echo; echo "Data Versioning:"; echo "================"
+  local dvc_ok=true
+  dvc_health_check || dvc_ok=false
+  [[ "$dvc_ok" == true ]] || all_healthy=false
+
+  # S3 access check (prefer DVC remote; else MLflow artifact root)
+  echo; echo "S3 Check:"; echo "========"
+  python3 - <<'PY' >/dev/null 2>&1
 import os, sys
 try:
-  import boto3
-  from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
-  uri=os.environ.get("MLFLOW_ARTIFACT_URI","")
-  if uri.startswith("s3://"):
-    bucket=uri.split("/",3)[2]
-    s3=boto3.client("s3", region_name=os.getenv("AWS_DEFAULT_REGION","eu-central-1"))
-    s3.list_objects_v2(Bucket=bucket, MaxKeys=1)
+    import boto3
+    from urllib.parse import urlparse
+    from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
+
+    dvc_url = os.getenv("DVC_REMOTE_URL","").strip()
+    target_url = ""
+    if dvc_url.startswith("s3://"):
+        target_url = dvc_url
+    else:
+        mlflow_uri = os.getenv("MLFLOW_ARTIFACT_URI","").strip()
+        if mlflow_uri.startswith("s3://"):
+            target_url = mlflow_uri
+
+    if not target_url:
+        sys.exit(0)  # nothing to check
+
+    parts = urlparse(target_url)
+    bucket = parts.netloc or parts.path.split("/")[1]
+    region = os.getenv("DVC_REGION") or os.getenv("AWS_DEFAULT_REGION") or "eu-central-1"
+    endpoint = os.getenv("DVC_ENDPOINT_URL") or None
+    session = boto3.session.Session(region_name=region)
+    s3 = session.client("s3", endpoint_url=endpoint) if endpoint else session.client("s3")
+    s3.head_bucket(Bucket=bucket)
 except Exception:
-  sys.exit(1)
+    sys.exit(1)
 PY
-    if [[ $? -eq 0 ]]; then
-      printf "%-15s: ${GREEN}✓ HEALTHY${NC}\n" "s3 (${MLFLOW_ARTIFACT_URI})"
-    else
-      printf "%-15s: ${RED}✗ UNHEALTHY${NC}\n" "s3 (${MLFLOW_ARTIFACT_URI})"
-      all_healthy=false
-    fi
+  if [[ $? -eq 0 ]]; then
+    printf "%-15s: ${GREEN}✓ HEALTHY${NC}\n" "s3"
+  else
+    printf "%-15s: ${RED}✗ UNHEALTHY${NC}\n" "s3"
+    all_healthy=false
   fi
 
   echo; echo "System Resources:"; echo "================"
@@ -541,6 +666,9 @@ start_all_services() {
   fi
 
   log_info "Starting services: ${services[*]}"
+
+  # Ensure DVC is configured from env before services run
+  dvc_bootstrap || log_warn "DVC bootstrap reported an issue; continuing"
 
   for s in "${services[@]}"; do
     case "$s" in postgresql|mongodb|minio) "start_$s"; [[ $? -eq 0 ]] && sleep "$wait_time";; esac
@@ -600,7 +728,7 @@ PY
   done
 
   [[ -z "${POSTGRES_PASSWORD:-}" ]] && log_warn "POSTGRES_PASSWORD not set (using default)"
-  if is_s3_artifacts; then
+  if is_s3_artifacts || [[ -n "$DVC_REMOTE_URL" ]]; then
     [[ -z "${AWS_ACCESS_KEY_ID:-}" ]] && log_warn "AWS_ACCESS_KEY_ID not set (S3 may fail)"
     [[ -z "${AWS_SECRET_ACCESS_KEY:-}" ]] && log_warn "AWS_SECRET_ACCESS_KEY not set (S3 may fail)"
   fi
@@ -608,19 +736,24 @@ PY
   local avail_kb; avail_kb=$(df "$PROJECT_ROOT" | awk 'NR==2{print $4}')
   if [[ ${avail_kb:-0} -lt 1000000 ]]; then log_warn "Low disk space: $((avail_kb/1024)) MB"; fi
 
-  # Light S3 check (optional)
-  if is_s3_artifacts; then
-    python3 - <<'PY' >/dev/null 2>&1 || log_warn "S3 check failed (verify AWS creds, region, bucket)"
+  # Light S3 check (optional, prefer DVC remote)
+  python3 - <<'PY' >/dev/null 2>&1 || log_warn "S3 quick check failed (verify AWS creds, region, bucket)"
 import os
 import boto3
+from urllib.parse import urlparse
 from botocore.exceptions import BotoCoreError, NoCredentialsError, ClientError
-uri=os.environ.get("MLFLOW_ARTIFACT_URI","")
+uri=os.environ.get("DVC_REMOTE_URL","").strip()
+if not uri or not uri.startswith("s3://"):
+    uri=os.environ.get("MLFLOW_ARTIFACT_URI","").strip()
 if uri.startswith("s3://"):
-    bucket=uri.split("/",3)[2]
-    s3=boto3.client("s3", region_name=os.getenv("AWS_DEFAULT_REGION","eu-central-1"))
+    parts=urlparse(uri)
+    bucket=parts.netloc or parts.path.split("/",1)[0]
+    region=os.getenv("DVC_REGION") or os.getenv("AWS_DEFAULT_REGION") or "eu-central-1"
+    endpoint=os.getenv("DVC_ENDPOINT_URL") or None
+    session=boto3.session.Session(region_name=region)
+    s3=session.client("s3", endpoint_url=endpoint) if endpoint else session.client("s3")
     s3.list_objects_v2(Bucket=bucket, MaxKeys=1)
 PY
-  fi
 
   if (( issues > 0 )); then log_warn "Validation found $issues issue(s)"; return 1
   else log_success "Environment validation passed"; return 0

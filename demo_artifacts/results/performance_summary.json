@@ -1,7 +1,0 @@
-{
-  "final_accuracy": 0.95,
-  "loss_reduction_pct": 0.7338489838868286,
-  "total_tokens": 10000000000.0,
-  "avg_gpu_util": 96.0,
-  "peak_mem_gb": 65.0
-}
