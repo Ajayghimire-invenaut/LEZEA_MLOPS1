@@ -1,13 +1,45 @@
-mlflow>=2.9,<2.13
-pymongo>=4.6
-boto3>=1.28
-prometheus-client>=0.20
-psutil>=5.9
-pynvml>=11.5
-python-dotenv>=1.0
-PyYAML>=6.0
-pydantic>=2.6
-requests>=2.31
-structlog>=24.1
-rich>=13.7
-pytest>=7.4
+###############################################################################
+# LeZeA MLOps — Production Dependencies
+# -----------------------------------------------------------------------------
+# Notes:
+# - MLflow is pinned to <2.13 to avoid breaking API/UI changes.
+# - On macOS we prefer psycopg2-binary; on Linux we prefer psycopg2.
+# - DVC with S3 extras is included so DVC + S3 checks work out-of-the-box.
+###############################################################################
+
+############################
+# Core MLOps Runtime
+############################
+mlflow>=2.9,<2.13             # tracking server & client
+dvc[s3]>=3.0                  # data versioning + S3 remote support
+
+############################
+# Databases & Storage
+############################
+pymongo>=4.6                  # MongoDB client
+# Postgres driver (choose best for the OS automatically)
+psycopg2-binary>=2.9; platform_system == "Darwin"
+psycopg2>=2.9; platform_system != "Darwin"
+
+boto3>=1.28                   # AWS SDK (S3, etc.)
+
+############################
+# Observability / Metrics
+############################
+prometheus-client>=0.20       # expose/parse Prometheus metrics
+pynvml>=11.5                  # NVIDIA GPU info (safe to keep; no-op if no GPU)
+
+############################
+# System & Utilities
+############################
+psutil>=5.9                   # system resource stats
+python-dotenv>=1.0            # load .env files
+PyYAML>=6.0                   # YAML config
+pydantic>=2.6                 # config/schema validation
+requests>=2.31                # HTTP client
+
+############################
+# Logging & Console UX
+############################
+structlog>=24.1               # structured logging
+rich>=13.7                    # pretty console output

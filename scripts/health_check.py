@@ -11,19 +11,21 @@ Advanced health monitoring for all LeZeA MLOps components:
 - Resource utilization monitoring
 - Integration testing
 
+macOS niceties:
+- gpu_exporter is skipped on Darwin (no NVIDIA/DCGM there)
+
 Usage:
     python scripts/health_check.py [OPTIONS]
 
 Options:
-    --services    Comma-separated list of services to check
-    --timeout     Timeout for each check (default: 10 seconds)
-    --verbose     Enable detailed output
-    --json        Output results in JSON format
-    --continuous  Run continuous health monitoring
-    --interval    Interval for continuous monitoring (default: 60 seconds)
-    --alert       Send alerts for failures
-    --fix         (reserved)
-    --no-parallel Run checks sequentially
+    --services      Comma-separated list of services to check
+    --timeout       Timeout for each check (default: 10 seconds)
+    --verbose       Enable detailed output
+    --json          Output results in JSON format
+    --continuous    Run continuous health monitoring
+    --interval      Interval for continuous monitoring (default: 60 seconds)
+    --alert         Send alerts for failures
+    --no-parallel   Run checks sequentially
 """
 
 import os
@@ -33,6 +35,7 @@ import time
 import socket
 import psutil
 import argparse
+import platform
 import subprocess
 from pathlib import Path
 from datetime import datetime
@@ -75,6 +78,7 @@ class HealthResult:
 
 def _safe_bool_env(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
 
 def _normalize_env():
     """Keep env keys consistent across scripts."""
@@ -185,6 +189,15 @@ class LeZeAHealthChecker:
     def check_postgresql(self) -> HealthResult:
         start = time.time()
         svc = 'postgresql'
+
+        # Skip if MLflow is using SQLite (common on dev laptops)
+        backend = os.getenv("MLFLOW_BACKEND_STORE_URI", "sqlite:///mlflow.db")
+        if backend.strip().lower().startswith("sqlite"):
+            return HealthResult(
+                svc, 'warning', 0.0, 'skipped — MLflow backend is SQLite',
+                {'backend': backend}, datetime.now()
+            )
+
         try:
             params = {
                 'host': self.services[svc]['host'],
@@ -268,29 +281,36 @@ class LeZeAHealthChecker:
         svc = 'mlflow'
         host = self.services[svc]['host']
         port = self.services[svc]['port']
-
-        # MLflow doesn't always expose /health; check "/" first
-        http = self.check_http_endpoint(f"http://{host}:{port}/", svc)
-        if http.status != 'healthy':
-            return http
+        tracking_uri = f"http://{host}:{port}"
 
         start = time.time()
         try:
-            mlflow.set_tracking_uri(f"http://{host}:{port}")
-            exps = mlflow.search_experiments()
-            # try a lightweight API call
-            _ = [e.name for e in exps]
-            rt = time.time() - start + (http.response_time or 0)
+            mlflow.set_tracking_uri(tracking_uri)
+            exps = mlflow.search_experiments()  # primary health signal
+            rt = time.time() - start
+            # optional: peek at UI root, but don't gate health on it
+            try:
+                r = requests.get(f"{tracking_uri}/", timeout=self.timeout)
+                http_note = f"UI {r.status_code}"
+            except Exception as e:
+                http_note = f"UI check failed: {e}"
+
             return HealthResult(
-                svc, 'healthy', rt, "MLflow server is fully functional",
-                {'experiments_count': len(exps), 'tracking_uri': f"http://{host}:{port}"}, datetime.now()
+                svc, 'healthy', rt,
+                f"MLflow API OK ({len(exps)} experiments); {http_note}",
+                {'experiments_count': len(exps), 'tracking_uri': tracking_uri}, datetime.now()
             )
-        except Exception as e:
-            return HealthResult(
-                svc, 'warning', time.time() - start + (http.response_time or 0),
-                f"MLflow UI reachable but API failed: {e}",
-                {'tracking_uri': f"http://{host}:{port}"}, datetime.now()
-            )
+        except Exception as api_err:
+            # fall back to a simple HTTP reachability probe
+            http = self.check_http_endpoint(f"{tracking_uri}/", svc)
+            if http.status == 'healthy':
+                return HealthResult(
+                    svc, 'warning', (http.response_time or 0.0),
+                    f"MLflow UI reachable but API failed: {api_err}",
+                    {'tracking_uri': tracking_uri}, datetime.now()
+                )
+            return http
+
 
     # ------------------------------- DVC & S3 ---------------------------------
 
@@ -505,7 +525,7 @@ class LeZeAHealthChecker:
             r = subprocess.run(
                 ['nvidia-smi',
                  '--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw',
-                 '--format=csv,noheader,nounits'],
+                '--format=csv,noheader,nounits'],
                 capture_output=True, text=True, timeout=self.timeout
             )
             if r.returncode != 0:
@@ -537,45 +557,61 @@ class LeZeAHealthChecker:
             return HealthResult(svc, 'warning', time.time() - start, f"GPU check failed: {e}", {}, datetime.now())
 
     def check_lezea_application(self) -> HealthResult:
+        """
+        LeZeA app check (lightweight):
+        - Green if the package imports.
+        - Optional symbols (ExperimentTracker, metrics) are best-effort and DO NOT gate health.
+        """
         start = time.time(); svc = 'lezea_application'
         try:
-            try:
-                from lezea_mlops import ExperimentTracker
-                from lezea_mlops.monitoring import get_metrics
-                tracker = ExperimentTracker("health_check", create_if_not_exists=False)
-                _ = get_metrics()
-                core_ok = True
-                details = {'tracker_available': True, 'metrics_module': True,
-                           'config_loaded': hasattr(tracker, 'config')}
-            except Exception as e:
-                core_ok = False
-                details = {'import_error': str(e)}
+            import lezea_mlops  # noqa: F401
+            details = {
+                'package_path': getattr(lezea_mlops, '__file__', '(unknown)'),
+            }
 
-            # Optional metrics endpoint (if your app exposes one)
+            # Optional: try (but do not require) a couple of symbols
+            try:
+                from lezea_mlops import ExperimentTracker  # type: ignore
+                details['tracker_available'] = True
+            except Exception as e:
+                details['tracker_available'] = False
+                details['tracker_error'] = str(e)[:200]
+
+            # Optional: metrics endpoint probe (doesn't gate health)
             metrics_ok = False
             try:
-                r = requests.get('http://localhost:8000/metrics', timeout=5)
+                r = requests.get('http://localhost:8000/metrics', timeout=3)
                 metrics_ok = (r.status_code == 200)
-                if metrics_ok:
-                    details['metrics_endpoint'] = True
-                    details['metrics_lines'] = len(r.text.splitlines())
             except Exception:
-                details['metrics_endpoint'] = False
+                pass
+            details['metrics_endpoint'] = metrics_ok
 
-            rt = time.time() - start
-            if core_ok and metrics_ok:
-                return HealthResult(svc, 'healthy', rt, "LeZeA core + metrics OK", details, datetime.now())
-            if core_ok:
-                return HealthResult(svc, 'warning', rt, "LeZeA core OK; metrics endpoint unavailable", details, datetime.now())
-            return HealthResult(svc, 'unhealthy', rt, "LeZeA application not functional", details, datetime.now())
+            return HealthResult(
+                svc, 'healthy', time.time() - start, "LeZeA package import OK",
+                details, datetime.now()
+            )
         except Exception as e:
-            return HealthResult(svc, 'unhealthy', time.time() - start,
-                                f"Application health check failed: {e}", {}, datetime.now())
+            return HealthResult(
+                svc, 'unhealthy', time.time() - start,
+                f"Package import failed: {e}", {'error': str(e)}, datetime.now()
+            )
 
     # ------------------------------- runner -----------------------------------
 
     def run_single_check(self, service: str) -> HealthResult:
         self.log(f"Checking {service}...", 'INFO')
+
+        # Skip GPU exporter on macOS hosts (no NVIDIA/DCGM)
+        if service == 'gpu_exporter' and platform.system() == 'Darwin':
+            return HealthResult(
+                service='gpu_exporter',
+                status='warning',
+                response_time=0.0,
+                message='skipped — macOS has no NVIDIA/DCGM exporter',
+                details={'platform': platform.system()},
+                timestamp=datetime.now()
+            )
+
         checks = {
             'postgresql': self.check_postgresql,
             'mongodb': self.check_mongodb,

@@ -3,21 +3,48 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "lezea-mlops"
+name = "lezea-mlops"                      # distribution name (pip install lezea-mlops)
 version = "0.1.0"
 description = "LeZeA MLOps utilities"
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = []
+
+# ---- Runtime dependencies (ship to your boss automatically) ----
+dependencies = [
+  "mlflow>=2.9,<2.13",
+  "pymongo>=4.6",
+  "boto3>=1.28",
+  "prometheus-client>=0.20",
+  "psutil>=5.9",
+  # pynvml isn't available/needed on macOS; guard it so Linux/Windows get it automatically
+  "pynvml>=11.5; platform_system != 'Darwin'",
+  "python-dotenv>=1.0",
+  "PyYAML>=6.0",
+  "pydantic>=2.6",
+  "requests>=2.31",
+  "structlog>=24.1",
+  "rich>=13.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
 
 [tool.setuptools]
-# use “find” discovery in current directory
+# Include non-Python files listed below directly from the package
+include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["lezea_mlops*"]
 exclude = [
-  "tests*", "examples*", "scripts*",
-  "viz*", "temp*", "logs*", "data*", "cache*",
+  "tests*", "examples*", "scripts*", "viz*", "temp*", "logs*", "data*", "cache*",
   "exports*", "services*", "artifacts*", "checkpoints*"
+]
+
+# Package data: include config/templates/etc inside the installed wheel
+[tool.setuptools.package-data]
+lezea_mlops = [
+  "config/**/*",
+  "templates/**/*",
+  "*.yaml", "*.yml", "*.json"
 ]
